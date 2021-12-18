@@ -159,6 +159,12 @@ impl SwfMovie {
     pub fn frame_rate(&self) -> Fixed8 {
         self.header.frame_rate()
     }
+
+    pub fn extend_from_slice(&mut self, other: &[u8]) -> (usize, usize) {
+        let start = self.data.len();
+        self.data.extend_from_slice(other);
+        (start, other.len() + start)
+    }
 }
 
 /// A shared-ownership reference to some portion of an SWF datastream.
