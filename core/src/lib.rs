@@ -23,7 +23,7 @@ extern crate downcast_rs;
 extern crate num_derive;
 
 #[macro_use]
-mod avm1;
+pub mod avm1;
 mod avm2;
 mod binary_data;
 pub mod bitmap;
