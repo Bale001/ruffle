@@ -7,6 +7,7 @@
 
 mod audio;
 mod custom_event;
+mod debugger;
 mod executor;
 mod navigator;
 mod storage;
@@ -263,6 +264,7 @@ impl App {
             .with_autoplay(true)
             .with_letterbox(Letterbox::On)
             .with_warn_on_unsupported_content(!opt.dont_warn_on_unsupported_content)
+            .with_debugger(debugger::RemoteDebuggerBackend::new(movie_url.clone()))
             .with_fullscreen(opt.fullscreen);
 
         let player = builder.build();
@@ -354,6 +356,7 @@ impl App {
 
                     // Core loop
                     winit::event::Event::MainEventsCleared if loaded => {
+                        self.player.lock().unwrap().debugger_mut().tick();
                         let new_time = Instant::now();
                         let dt = new_time.duration_since(time).as_micros();
                         if dt > 0 {

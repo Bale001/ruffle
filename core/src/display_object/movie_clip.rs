@@ -516,6 +516,7 @@ impl<'gc> MovieClip<'gc> {
                 .0
                 .write(context.gc_context)
                 .define_binary_data(context, reader),
+            TagCode::EnableDebugger2 => self.enable_debugger(context, reader),
             _ => Ok(()),
         };
         let _ = tag_utils::decode_tags(&mut reader, tag_callback, TagCode::End);
@@ -528,6 +529,21 @@ impl<'gc> MovieClip<'gc> {
 
         self.0.write(context.gc_context).static_data =
             Gc::allocate(context.gc_context, static_data);
+    }
+
+    fn enable_debugger(
+        self,
+        context: &mut UpdateContext<'_, 'gc, '_>,
+        reader: &mut SwfStream<'_>,
+    ) -> DecodeResult {
+        reader.read_u16()?;
+        let password = reader.read_str()?;
+        if !*context.debugging_enabled {
+            *context.debugging_enabled = context
+                .debugger
+                .connect(&password.to_str_lossy(encoding_rs::UTF_8), 7935);
+        }
+        Ok(())
     }
 
     #[inline]

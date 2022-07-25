@@ -3083,6 +3083,7 @@ name = "ruffle_desktop"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "clipboard",
  "cpal",
@@ -3092,6 +3093,8 @@ dependencies = [
  "generational-arena",
  "isahc",
  "log",
+ "num-derive",
+ "num-traits",
  "rfd",
  "ruffle_core",
  "ruffle_render_wgpu",

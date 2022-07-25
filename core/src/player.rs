@@ -12,6 +12,7 @@ use crate::avm2::{
 };
 use crate::backend::{
     audio::{AudioBackend, AudioManager},
+    debugger::DebuggerBackend,
     log::LogBackend,
     navigator::{NavigatorBackend, Request},
     storage::StorageBackend,
@@ -190,6 +191,7 @@ type Storage = Box<dyn StorageBackend>;
 type Log = Box<dyn LogBackend>;
 type Ui = Box<dyn UiBackend>;
 type Video = Box<dyn VideoBackend>;
+type Debugger = Box<dyn DebuggerBackend>;
 
 pub struct Player {
     /// The version of the player we're emulating.
@@ -218,6 +220,7 @@ pub struct Player {
     log: Log,
     ui: Ui,
     video: Video,
+    debugger: Debugger,
 
     transform_stack: TransformStack,
 
@@ -273,6 +276,9 @@ pub struct Player {
     /// The current frame of the main timeline, if available.
     /// The first frame is frame 1.
     current_frame: Option<u16>,
+
+    /// Whether or not debugging is enabled.
+    debugging_enabled: bool,
 }
 
 impl Player {
@@ -1421,6 +1427,14 @@ impl Player {
         &mut self.ui
     }
 
+    pub fn debugger(&self) -> &Debugger {
+        &self.debugger
+    }
+
+    pub fn debugger_mut(&mut self) -> &mut Debugger {
+        &mut self.debugger
+    }
+
     pub fn run_actions<'gc>(context: &mut UpdateContext<'_, 'gc, '_>) {
         // Note that actions can queue further actions, so a while loop is necessary here.
         while let Some(actions) = context.action_queue.pop_action() {
@@ -1582,6 +1596,7 @@ impl Player {
                 storage: self.storage.deref_mut(),
                 log: self.log.deref_mut(),
                 video: self.video.deref_mut(),
+                debugger: self.debugger.deref_mut(),
                 shared_objects,
                 unbound_text_fields,
                 timers,
@@ -1600,6 +1615,7 @@ impl Player {
                 frame_rate: &mut self.frame_rate,
                 actions_since_timeout_check: &mut self.actions_since_timeout_check,
                 frame_phase: &mut self.frame_phase,
+                debugging_enabled: &mut self.debugging_enabled,
             };
 
             let old_frame_rate = *update_context.frame_rate;
@@ -1753,6 +1769,7 @@ pub struct PlayerBuilder {
     storage: Option<Storage>,
     ui: Option<Ui>,
     video: Option<Video>,
+    debugger: Option<Debugger>,
 
     // Misc. player configuration
     autoplay: bool,
@@ -1782,6 +1799,7 @@ impl PlayerBuilder {
             storage: None,
             ui: None,
             video: None,
+            debugger: None,
 
             autoplay: false,
             fullscreen: false,
@@ -1845,6 +1863,13 @@ impl PlayerBuilder {
     #[inline]
     pub fn with_ui(mut self, ui: impl 'static + UiBackend) -> Self {
         self.ui = Some(Box::new(ui));
+        self
+    }
+
+    /// Sets the debugger backend of the player.
+    #[inline]
+    pub fn with_debugger(mut self, debugger: impl 'static + DebuggerBackend) -> Self {
+        self.debugger = Some(Box::new(debugger));
         self
     }
 
@@ -1938,6 +1963,9 @@ impl PlayerBuilder {
         let video = self
             .video
             .unwrap_or_else(|| Box::new(video::NullVideoBackend::new()));
+        let debugger = self
+            .debugger
+            .unwrap_or_else(|| Box::new(debugger::NullDebuggerBackend));
 
         // Instantiate the player.
         let fake_movie = Arc::new(SwfMovie::empty(NEWEST_PLAYER_VERSION));
@@ -1952,6 +1980,7 @@ impl PlayerBuilder {
                 storage,
                 ui,
                 video,
+                debugger,
 
                 // SWF info
                 swf: fake_movie.clone(),
@@ -1984,6 +2013,7 @@ impl PlayerBuilder {
                 needs_render: true,
                 warn_on_unsupported_content: self.warn_on_unsupported_content,
                 self_reference: self_ref.clone(),
+                debugging_enabled: false,
 
                 // GC data
                 gc_arena: Rc::new(RefCell::new(GcArena::new(

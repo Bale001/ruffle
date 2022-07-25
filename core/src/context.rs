@@ -5,6 +5,7 @@ use crate::avm1::{Avm1, Object as Avm1Object, Value as Avm1Value};
 use crate::avm2::{Avm2, Object as Avm2Object, SoundChannelObject, Value as Avm2Value};
 use crate::backend::{
     audio::{AudioBackend, AudioManager, SoundHandle, SoundInstanceHandle},
+    debugger::DebuggerBackend,
     log::LogBackend,
     navigator::NavigatorBackend,
     storage::StorageBackend,
@@ -85,6 +86,8 @@ pub struct UpdateContext<'a, 'gc, 'gc_context> {
 
     /// The video backend, used for video decoding
     pub video: &'a mut dyn VideoBackend,
+
+    pub debugger: &'a mut dyn DebuggerBackend,
 
     /// The RNG, used by the AVM `RandomNumber` opcode,  `Math.random(),` and `random()`.
     pub rng: &'a mut SmallRng,
@@ -174,6 +177,9 @@ pub struct UpdateContext<'a, 'gc, 'gc_context> {
     ///
     /// If we are not doing frame processing, then this is `FramePhase::Enter`.
     pub frame_phase: &'a mut FramePhase,
+
+    /// Whether or not debugging is enabled.
+    pub debugging_enabled: &'a mut bool,
 }
 
 /// Convenience methods for controlling audio.
@@ -306,6 +312,7 @@ impl<'a, 'gc, 'gc_context> UpdateContext<'a, 'gc, 'gc_context> {
             log: self.log,
             ui: self.ui,
             video: self.video,
+            debugger: self.debugger,
             storage: self.storage,
             rng: self.rng,
             stage: self.stage,
@@ -334,6 +341,7 @@ impl<'a, 'gc, 'gc_context> UpdateContext<'a, 'gc, 'gc_context> {
             frame_rate: self.frame_rate,
             actions_since_timeout_check: self.actions_since_timeout_check,
             frame_phase: self.frame_phase,
+            debugging_enabled: self.debugging_enabled,
         }
     }
 
