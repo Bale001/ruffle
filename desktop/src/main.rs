@@ -193,7 +193,7 @@ impl App {
             Some(path) => Some(std::borrow::Cow::Borrowed(path)),
             None => pick_file().map(std::borrow::Cow::Owned),
         };
-        let movie_url = if let Some(path) = path {
+        let movie_url = if let Some(ref path) = path {
             Some(parse_url(&path).context("Couldn't load specified path")?)
         } else {
             shutdown();
@@ -264,7 +264,9 @@ impl App {
             .with_autoplay(true)
             .with_letterbox(Letterbox::On)
             .with_warn_on_unsupported_content(!opt.dont_warn_on_unsupported_content)
-            .with_debugger(debugger::RemoteDebuggerBackend::new(movie_url.clone()))
+            .with_debugger(debugger::RemoteDebuggerBackend::new(
+                path.unwrap().into_owned(),
+            ))
             .with_fullscreen(opt.fullscreen);
 
         let player = builder.build();
