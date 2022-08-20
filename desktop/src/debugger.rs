@@ -5,28 +5,13 @@ use bytes::{Buf, Bytes, BytesMut};
 use message::{ClientMessageKind, ServerMessageKind};
 use num_traits::cast::FromPrimitive;
 use ruffle_core::backend::debugger::DebuggerBackend;
-use serialize::DebugBuilder;
+use ruffle_core::tag_utils::SwfMovie;
+use serialize::{DebugBuilder, DebuggerSerialize};
+use std::cell::RefCell;
+use std::io::Read;
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::{fs::File, io::Read};
-use swd_rs::{Swd, SwdReader};
-
-macro_rules! send_debug {
-    ($stream: expr, $kind: expr) => {
-        if let Some(stream) = &mut $stream {
-            let _ = DebugBuilder::new($kind).send(stream);
-        }
-    };
-    ($stream: expr, $kind: expr, $($field:expr),+) => {
-        if let Some(stream) = &mut $stream {
-            let mut builder = DebugBuilder::new($kind);
-            $(
-                builder.add($field);
-            )+
-            let _ = builder.send(stream);
-        }
-    };
-}
+use std::sync::Arc;
 
 #[allow(dead_code)]
 #[derive(Default)]
@@ -48,6 +33,34 @@ struct DebuggerProperties {
     wide_line_debugger: bool,
 }
 
+struct DebugSender<'a> {
+    builder: DebugBuilder,
+    stream: &'a RefCell<Option<TcpStream>>,
+}
+
+impl<'a> DebugSender<'a> {
+    fn arg(mut self, f: impl DebuggerSerialize) -> Self {
+        if self.stream.borrow().is_some() {
+            self.builder.add(f)
+        }
+        self
+    }
+
+    fn add(&mut self, f: impl DebuggerSerialize) {
+        if self.stream.borrow().is_some() {
+            self.builder.add(f)
+        }
+    }
+
+    fn send(self) {
+        if let Some(stream) = self.stream.borrow_mut().as_mut() {
+            if let Err(e) = self.builder.send(stream) {
+                log::warn!("Unable to send debug data: {}", e);
+            }
+        }
+    }
+}
+
 fn display_message(message: &str) {
     let dialog = rfd::MessageDialog::new()
         .set_level(rfd::MessageLevel::Info)
@@ -57,15 +70,10 @@ fn display_message(message: &str) {
     dialog.show();
 }
 
-fn read_swd(path: PathBuf) -> Option<Swd> {
-    let file = File::open(path).ok()?;
-    SwdReader::new(file).read().ok()
-}
-
 pub struct RemoteDebuggerBackend {
-    stream: Option<TcpStream>,
+    stream: RefCell<Option<TcpStream>>,
+    movies: Vec<Arc<SwfMovie>>,
     path: PathBuf,
-    swd: Option<Swd>,
 
     properties: DebuggerProperties,
     squelch: bool,
@@ -76,12 +84,10 @@ pub struct RemoteDebuggerBackend {
 
 impl RemoteDebuggerBackend {
     pub fn new(file_url: PathBuf) -> Self {
-        let swd_url = file_url.with_extension("swd");
-        //std::fs::copy(&file_url, "/Users/haydencurtis/Desktop/rust/ruffle/test_avm2_b.swd").unwrap();
         Self {
-            stream: None,
+            stream: RefCell::new(None),
+            movies: Vec::new(),
             path: file_url,
-            swd: read_swd(swd_url),
             properties: DebuggerProperties::default(),
             squelch: false,
             packet_kind: None,
@@ -89,16 +95,26 @@ impl RemoteDebuggerBackend {
         }
     }
 
+    fn build(&self, kind: ServerMessageKind) -> DebugSender {
+        DebugSender {
+            builder: DebugBuilder::new(kind),
+            stream: &self.stream,
+        }
+    }
+
     fn read_header(&mut self) -> Option<(u32, ClientMessageKind)> {
-        let stream = self.stream.as_mut()?;
-        let mut buf = [0; 8];
+        if let Some(stream) = self.stream.borrow_mut().as_mut() {
+            let mut buf = [0; 8];
 
-        stream.read_exact(&mut buf).ok()?;
-        let length = u32::from_le_bytes(buf[..4].try_into().unwrap());
-        let message_kind =
-            ClientMessageKind::from_u32(u32::from_le_bytes(buf[4..].try_into().unwrap()))?;
+            stream.read_exact(&mut buf).ok()?;
+            let length = u32::from_le_bytes(buf[..4].try_into().unwrap());
+            let message_kind =
+                ClientMessageKind::from_u32(u32::from_le_bytes(buf[4..].try_into().unwrap()))?;
 
-        Some((length, message_kind))
+            Some((length, message_kind))
+        } else {
+            None
+        }
     }
 
     fn execute(&mut self, kind: ClientMessageKind) -> Option<bool> {
@@ -106,6 +122,9 @@ impl RemoteDebuggerBackend {
             ClientMessageKind::SetDebugOption => self.set_debug_option()?,
             ClientMessageKind::GetDebugOption => self.get_debug_option()?,
             ClientMessageKind::SetSquelch => self.set_squelch()?,
+            ClientMessageKind::GetInfo => self.get_info()?,
+            ClientMessageKind::GetContent => self.get_content()?,
+            ClientMessageKind::GetDebugContent => self.get_debug_content()?,
             ClientMessageKind::Continue => return Some(true),
             _ => display_message(&format!("Unknown message {:?}", kind)),
         }
@@ -138,7 +157,52 @@ impl RemoteDebuggerBackend {
 
     fn set_squelch(&mut self) -> Option<()> {
         self.squelch = self.read_u32()? != 0;
-        send_debug!(self.stream, ServerMessageKind::Squelch, self.squelch as u32);
+        self.build(ServerMessageKind::Squelch)
+            .arg(self.squelch as u32)
+            .send();
+        Some(())
+    }
+
+    fn get_content(&mut self) -> Option<()> {
+        // TODO: We should be sending all of the SWF's content here.
+        // JPEX does not require this, so we'll send it empty for now.
+        self.build(ServerMessageKind::SwfImage).send();
+        Some(())
+    }
+
+    fn get_debug_content(&mut self) -> Option<()> {
+        // TODO: When SWD's are supported, this should return SWD content.
+        self.build(ServerMessageKind::SwfImage).send();
+        Some(())
+    }
+
+    fn get_info(&mut self) -> Option<()> {
+        let mut builder = self.build(ServerMessageKind::SwfInfo);
+        builder.add(self.movies.len() as u16);
+        for (i, movie) in self.movies.iter().enumerate() {
+            builder.add(i as u32);
+            builder.add(Arc::as_ptr(movie) as usize);
+            builder.add(false);
+            builder.add(0u8);
+            builder.add(0u16);
+            builder.add(movie.uncompressed_len() as u32);
+            builder.add(0u32);
+            // TODO: Get script count.
+            builder.add(0u32);
+            // Offset count
+            builder.add(0u32);
+            // Breakpoint count
+            builder.add(0u32);
+            // Port
+            builder.add(0u32);
+            // Path (empty for now)
+            builder.add("");
+            // Url (empty for now)
+            builder.add("");
+            // Host (empty for now)
+            builder.add("");
+        }
+        builder.send();
         Some(())
     }
 
@@ -160,12 +224,10 @@ impl RemoteDebuggerBackend {
             b"setter_timeout" => self.properties.setter_timeout.to_string(),
             _ => return None,
         };
-        send_debug!(
-            self.stream,
-            ServerMessageKind::DebuggerOption,
-            &*prop,
-            &*val
-        );
+        self.build(ServerMessageKind::DebuggerOption)
+            .arg(&*prop)
+            .arg(&*val)
+            .send();
         Some(())
     }
 
@@ -174,106 +236,84 @@ impl RemoteDebuggerBackend {
         match &*prop {
             b"disable_script_stuck_dialog" => {
                 self.properties.disable_script_stuck_dialog = self.read_switch()?;
-                send_debug!(
-                    self.stream,
-                    ServerMessageKind::DebuggerOption,
-                    "disable_script_stuck_dialog",
-                    &*self.properties.disable_script_stuck_dialog.to_string()
-                )
+                self.build(ServerMessageKind::DebuggerOption)
+                    .arg("disable_script_stuck_dialog")
+                    .arg(&*self.properties.disable_script_stuck_dialog.to_string())
+                    .send();
             }
             b"disable_script_stuck" => {
                 self.properties.disable_script_stuck = self.read_switch()?;
-                send_debug!(
-                    self.stream,
-                    ServerMessageKind::DebuggerOption,
-                    "disable_script_stuck",
-                    &*self.properties.disable_script_stuck.to_string()
-                )
+                self.build(ServerMessageKind::DebuggerOption)
+                    .arg("disable_script_stuck")
+                    .arg(&*self.properties.disable_script_stuck.to_string())
+                    .send();
             }
             b"break_on_fault" => {
                 self.properties.break_on_fault = self.read_switch()?;
-                send_debug!(
-                    self.stream,
-                    ServerMessageKind::DebuggerOption,
-                    "break_on_fault",
-                    &*self.properties.break_on_fault.to_string()
-                )
+                self.build(ServerMessageKind::DebuggerOption)
+                    .arg("break_on_fault")
+                    .arg(&*self.properties.break_on_fault.to_string())
+                    .send();
             }
             b"enumerate_override" => {
                 self.properties.enumerate_override = self.read_switch()?;
-                send_debug!(
-                    self.stream,
-                    ServerMessageKind::DebuggerOption,
-                    "enumerate_override",
-                    &*self.properties.enumerate_override.to_string()
-                )
+                self.build(ServerMessageKind::DebuggerOption)
+                    .arg("enumerate_override")
+                    .arg(&*self.properties.enumerate_override.to_string())
+                    .send();
             }
             b"notify_on_failure" => {
                 self.properties.notify_on_failure = self.read_switch()?;
-                send_debug!(
-                    self.stream,
-                    ServerMessageKind::DebuggerOption,
-                    "notify_on_failure",
-                    &*self.properties.notify_on_failure.to_string()
-                )
+                self.build(ServerMessageKind::DebuggerOption)
+                    .arg("notify_on_failure")
+                    .arg(&*self.properties.notify_on_failure.to_string())
+                    .send();
             }
             b"invoke_setters" => {
                 self.properties.invoke_setters = self.read_switch()?;
-                send_debug!(
-                    self.stream,
-                    ServerMessageKind::DebuggerOption,
-                    "invoke_setters",
-                    &*self.properties.invoke_setters.to_string()
-                )
+                self.build(ServerMessageKind::DebuggerOption)
+                    .arg("invoke_setters")
+                    .arg(&*self.properties.invoke_setters.to_string())
+                    .send();
             }
             b"wide_line_player" => {
                 self.properties.wide_line_player = self.read_switch()?;
-                send_debug!(
-                    self.stream,
-                    ServerMessageKind::DebuggerOption,
-                    "wide_line_player",
-                    &*self.properties.wide_line_player.to_string()
-                )
+                self.build(ServerMessageKind::DebuggerOption)
+                    .arg("wide_line_player")
+                    .arg(&*self.properties.wide_line_player.to_string())
+                    .send();
             }
             b"wide_line_debugger" => {
                 self.properties.wide_line_debugger = self.read_switch()?;
-                send_debug!(
-                    self.stream,
-                    ServerMessageKind::DebuggerOption,
-                    "wide_line_debugger",
-                    &*self.properties.wide_line_debugger.to_string()
-                )
+                self.build(ServerMessageKind::DebuggerOption)
+                    .arg("wide_line_debugger")
+                    .arg(&*self.properties.wide_line_debugger.to_string())
+                    .send();
             }
             b"swf_load_messages" => {
                 self.properties.swf_load_messages = self.read_switch()?;
-                send_debug!(
-                    self.stream,
-                    ServerMessageKind::DebuggerOption,
-                    "swf_load_messages",
-                    &*self.properties.swf_load_messages.to_string()
-                )
+                self.build(ServerMessageKind::DebuggerOption)
+                    .arg("swf_load_messages")
+                    .arg(&*self.properties.swf_load_messages.to_string())
+                    .send();
             }
             b"getter_timeout" => {
                 let prop = self.read_string()?;
                 let value = std::str::from_utf8(&prop).ok()?;
                 self.properties.getter_timeout = value.parse().ok()?;
-                send_debug!(
-                    self.stream,
-                    ServerMessageKind::DebuggerOption,
-                    "getter_timeout",
-                    value
-                )
+                self.build(ServerMessageKind::DebuggerOption)
+                    .arg("getter_timeout")
+                    .arg(value)
+                    .send();
             }
             b"setter_timeout" => {
                 let prop = self.read_string()?;
                 let value = std::str::from_utf8(&prop).ok()?;
                 self.properties.setter_timeout = value.parse().ok()?;
-                send_debug!(
-                    self.stream,
-                    ServerMessageKind::DebuggerOption,
-                    "setter_timeout",
-                    value
-                )
+                self.build(ServerMessageKind::DebuggerOption)
+                    .arg("setter_timeout")
+                    .arg(value)
+                    .send();
             }
             _ => (),
         }
@@ -284,17 +324,18 @@ impl RemoteDebuggerBackend {
 impl DebuggerBackend for RemoteDebuggerBackend {
     fn tick(&mut self) -> Option<bool> {
         let mut should_continue = false;
-        if let Some(stream) = self.stream.as_mut() {
-            if let Some(kind) = self.packet_kind {
+        if let Some(kind) = self.packet_kind {
+            if let Some(stream) = self.stream.borrow_mut().as_mut() {
                 stream.read_exact(&mut self.data).ok()?;
-                self.packet_kind = None;
-                should_continue = self.execute(kind).unwrap_or(false);
-                self.data.clear();
-            } else {
-                let (length, kind) = self.read_header()?;
-                self.data.resize(length as usize, 0);
-                self.packet_kind = Some(kind);
             }
+
+            self.packet_kind = None;
+            should_continue = self.execute(kind).unwrap_or(false);
+            self.data.clear();
+        } else {
+            let (length, kind) = self.read_header()?;
+            self.data.resize(length as usize, 0);
+            self.packet_kind = Some(kind);
         }
         Some(should_continue)
     }
@@ -304,32 +345,26 @@ impl DebuggerBackend for RemoteDebuggerBackend {
             stream
                 .set_nonblocking(true)
                 .expect("failed to set debug stream as nonblocking");
-            self.stream = Some(stream);
+            *self.stream.borrow_mut() = Some(stream);
 
-            send_debug!(self.stream, ServerMessageKind::SetVersion, 0x0fu32);
-            send_debug!(
-                self.stream,
-                ServerMessageKind::MovieAttribute,
-                "movie",
-                self.path.as_os_str()
-            );
-            send_debug!(
-                self.stream,
-                ServerMessageKind::MovieAttribute,
-                "password",
-                password
-            );
+            self.build(ServerMessageKind::SetVersion)
+                .arg(0x0fu32)
+                .send();
+            self.build(ServerMessageKind::MovieAttribute)
+                .arg("movie")
+                .arg(self.path.as_os_str())
+                .send();
+            self.build(ServerMessageKind::MovieAttribute)
+                .arg("password")
+                .arg(password)
+                .send();
             true
         } else {
             false
         }
     }
 
-    fn on_position(&mut self, pos: u32) -> bool {
-        if let Some(swd) = self.swd.as_ref() {
-            swd.resolve_breakpoint(pos).is_some()
-        } else {
-            false
-        }
+    fn add_movie(&mut self, movie: Arc<SwfMovie>) {
+        self.movies.push(movie)
     }
 }

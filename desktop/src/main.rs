@@ -276,7 +276,6 @@ impl App {
             let on_metadata = move |swf_header: &ruffle_core::swf::HeaderExt| {
                 let _ = event_loop_proxy.send_event(RuffleEvent::OnMetadata(swf_header.clone()));
             };
-
             player.lock().unwrap().fetch_root_movie(
                 movie_url.to_string(),
                 parse_parameters(&opt).collect(),

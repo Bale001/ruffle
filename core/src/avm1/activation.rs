@@ -25,7 +25,6 @@ use std::cell::{Ref, RefMut};
 use std::fmt;
 use swf::avm1::read::Reader;
 use swf::avm1::types::*;
-use swf::extensions::ReadSwfExt;
 use url::form_urlencoded;
 
 macro_rules! avm_debug {
@@ -452,14 +451,6 @@ impl<'a, 'gc, 'gc_context> Activation<'a, 'gc, 'gc_context> {
             //Executing beyond the end of a function constitutes an implicit return.
             Ok(FrameControl::Return(ReturnType::Implicit))
         } else {
-            if self
-                .context
-                .debugger
-                .on_position((reader.pos(data.movie.data()) + 0x15) as u32)
-            {
-                println!("breakpoint hit");
-                while !self.context.debugger.tick().unwrap_or(false) {}
-            }
             let action = reader.read_action()?;
             avm_debug!(
                 self.context.avm1,

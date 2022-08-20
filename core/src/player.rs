@@ -301,6 +301,8 @@ impl Player {
             );
             context.navigator.spawn_future(future);
         });
+
+        self.debugger.add_movie(self.swf.clone());
     }
 
     /// Change the root movie.

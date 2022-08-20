@@ -49,6 +49,12 @@ impl DebuggerSerialize for u8 {
     }
 }
 
+impl DebuggerSerialize for bool {
+    fn debug_serialize(&self, output: &mut impl Write) -> std::io::Result<()> {
+        (*self as u8).debug_serialize(output)
+    }
+}
+
 pub struct DebugBuilder {
     kind: ServerMessageKind,
     data: Vec<u8>,

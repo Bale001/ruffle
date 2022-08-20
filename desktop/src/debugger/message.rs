@@ -58,4 +58,7 @@ pub enum ServerMessageKind {
     DebuggerOption = 0x20,
     MovieAttribute = 0x0C,
     NumSwdEntries = 0x14,
+    SwfInfo = 0x2a,
+    SwfImage = 0x22,
+    SwdImage = 0x23,
 }
