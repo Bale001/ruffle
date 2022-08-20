@@ -61,4 +61,19 @@ pub enum ServerMessageKind {
     SwfInfo = 0x2a,
     SwfImage = 0x22,
     SwdImage = 0x23,
+    SuspendReason = 0x28,
+}
+
+#[derive(Debug, Copy, Clone)]
+#[repr(u16)]
+#[allow(dead_code)]
+pub enum SuspendReason {
+    Unknown = 0,
+    Breakpoint = 1,
+    Watch = 2,
+    Fault = 3,
+    StopRequest = 4,
+    Step = 5,
+    Halt = 6,
+    ScriptLoaded = 7,
 }

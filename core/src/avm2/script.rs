@@ -209,7 +209,9 @@ impl<'gc> TranslationUnit<'gc> {
         self.0.write(activation.context.gc_context).scripts[script_index as usize] = Some(script);
 
         script.load_traits(self, script_index, &mut activation)?;
-
+        if *activation.context.debugging_enabled {
+            activation.context.debugger.on_script_loaded();
+        }
         Ok(script)
     }
 

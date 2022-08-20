@@ -2,7 +2,7 @@ mod message;
 mod serialize;
 
 use bytes::{Buf, Bytes, BytesMut};
-use message::{ClientMessageKind, ServerMessageKind};
+use message::{ClientMessageKind, ServerMessageKind, SuspendReason};
 use num_traits::cast::FromPrimitive;
 use ruffle_core::backend::debugger::DebuggerBackend;
 use ruffle_core::tag_utils::SwfMovie;
@@ -77,6 +77,7 @@ pub struct RemoteDebuggerBackend {
 
     properties: DebuggerProperties,
     squelch: bool,
+    script_loaded: bool,
 
     packet_kind: Option<ClientMessageKind>,
     data: BytesMut,
@@ -90,6 +91,7 @@ impl RemoteDebuggerBackend {
             path: file_url,
             properties: DebuggerProperties::default(),
             squelch: false,
+            script_loaded: false,
             packet_kind: None,
             data: BytesMut::new(),
         }
@@ -172,7 +174,7 @@ impl RemoteDebuggerBackend {
 
     fn get_debug_content(&mut self) -> Option<()> {
         // TODO: When SWD's are supported, this should return SWD content.
-        self.build(ServerMessageKind::SwfImage).send();
+        self.build(ServerMessageKind::SwdImage).send();
         Some(())
     }
 
@@ -366,5 +368,19 @@ impl DebuggerBackend for RemoteDebuggerBackend {
 
     fn add_movie(&mut self, movie: Arc<SwfMovie>) {
         self.movies.push(movie)
+    }
+
+    fn on_script_loaded(&mut self) {
+        if self.script_loaded {
+            return
+        }
+        self.script_loaded = true;
+        self.build(ServerMessageKind::SuspendReason)
+            .arg(SuspendReason::ScriptLoaded as u16)
+            .arg(0u16)
+            .arg(u32::MAX)
+            .arg(u32::MAX)
+            .arg(u32::MAX)
+            .send()
     }
 }
