@@ -62,6 +62,9 @@ pub enum ServerMessageKind {
     SwfImage = 0x22,
     SwdImage = 0x23,
     SuspendReason = 0x28,
+    BreakpointHit = 0x10,
+    BreakpointHitEx = 0x1b,
+    AskBreakpoints = 0x0f,
 }
 
 #[derive(Debug, Copy, Clone)]

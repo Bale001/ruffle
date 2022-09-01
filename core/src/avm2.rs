@@ -143,7 +143,7 @@ impl<'gc> Avm2<'gc> {
     ) -> Result<(), Error> {
         let mut init_activation = Activation::from_script(context.reborrow(), script)?;
 
-        let (method, scope, _domain) = script.init();
+        let (method, scope, domain) = script.init();
         match method {
             Method::Native(method) => {
                 //This exists purely to check if the builtin is OK with being called with
@@ -165,6 +165,9 @@ impl<'gc> Avm2<'gc> {
                     .context
                     .avm2
                     .push_global_init(init_activation.context.gc_context);
+                if *init_activation.context.debugging_enabled && !domain.is_avm2_global_domain(&mut init_activation) {
+                    init_activation.context.debugger.on_script_loaded(&init_activation.context.avm2.call_stack().read());
+                }
                 let r = init_activation.run_actions(method);
                 init_activation
                     .context
@@ -297,7 +300,7 @@ impl<'gc> Avm2<'gc> {
 
         for i in (0..abc_file.scripts.len()).rev() {
             let mut script = tunit.load_script(i as u32, context)?;
-
+        
             if !do_abc.flags.contains(DoAbcFlag::LAZY_INITIALIZE) {
                 script.globals(context)?;
             }

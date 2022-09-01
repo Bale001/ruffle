@@ -5,6 +5,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use message::{ClientMessageKind, ServerMessageKind, SuspendReason};
 use num_traits::cast::FromPrimitive;
 use ruffle_core::backend::debugger::DebuggerBackend;
+use ruffle_core::Avm2Callstack;
 use ruffle_core::tag_utils::SwfMovie;
 use serialize::{DebugBuilder, DebuggerSerialize};
 use std::cell::RefCell;
@@ -81,6 +82,7 @@ pub struct RemoteDebuggerBackend {
 
     packet_kind: Option<ClientMessageKind>,
     data: BytesMut,
+    suspension_reason: Option<SuspendReason>
 }
 
 impl RemoteDebuggerBackend {
@@ -94,6 +96,7 @@ impl RemoteDebuggerBackend {
             script_loaded: false,
             packet_kind: None,
             data: BytesMut::new(),
+            suspension_reason: None
         }
     }
 
@@ -321,6 +324,12 @@ impl RemoteDebuggerBackend {
         }
         Some(())
     }
+
+    fn breakpoint_hit(&mut self, reason: SuspendReason, file_id: u16, addr: usize, func_name: &str, call_stack: &Avm2Callstack<'_>) {
+        self.suspension_reason = Some(reason);
+        self.build(ServerMessageKind::BreakpointHit).arg(file_id).arg(addr).arg(func_name).send();
+        self.build(ServerMessageKind::BreakpointHitEx).arg(file_id).arg(0u16).arg(call_stack).send();
+    }
 }
 
 impl DebuggerBackend for RemoteDebuggerBackend {
@@ -360,6 +369,7 @@ impl DebuggerBackend for RemoteDebuggerBackend {
                 .arg("password")
                 .arg(password)
                 .send();
+            self.build(ServerMessageKind::AskBreakpoints).send();
             true
         } else {
             false
@@ -370,17 +380,11 @@ impl DebuggerBackend for RemoteDebuggerBackend {
         self.movies.push(movie)
     }
 
-    fn on_script_loaded(&mut self) {
+    fn on_script_loaded(&mut self, call_stack: &Avm2Callstack<'_>) {
         if self.script_loaded {
             return
         }
         self.script_loaded = true;
-        self.build(ServerMessageKind::SuspendReason)
-            .arg(SuspendReason::ScriptLoaded as u16)
-            .arg(0u16)
-            .arg(u32::MAX)
-            .arg(u32::MAX)
-            .arg(u32::MAX)
-            .send()
+        self.breakpoint_hit(SuspendReason::ScriptLoaded, u16::MAX, 1, "", call_stack);
     }
 }

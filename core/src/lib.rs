@@ -47,6 +47,7 @@ pub use context_menu::ContextMenuItem;
 pub use events::PlayerEvent;
 pub use indexmap;
 pub use player::{Player, PlayerBuilder, StaticCallstack};
+pub use avm2::{CallStack as Avm2Callstack, CallNode as Avm2CallNode};
 pub use ruffle_render::backend::ViewportDimensions;
 pub use swf;
 pub use swf::Color;

@@ -20,6 +20,10 @@ impl<'gc> CallStack<'gc> {
         Self { stack: Vec::new() }
     }
 
+    pub fn nodes(&self) -> &[CallNode<'gc>] {
+        &self.stack
+    }
+
     pub fn push(&mut self, exec: Executable<'gc>) {
         self.stack.push(CallNode::Method(exec))
     }
