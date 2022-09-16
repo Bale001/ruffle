@@ -3213,7 +3213,7 @@ dependencies = [
  "log",
  "once_cell",
  "ouroboros",
- "raw-window-handle 0.4.3",
+ "raw-window-handle 0.5.0",
  "ruffle_render",
  "swf",
  "typed-arena",
