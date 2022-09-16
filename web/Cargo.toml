@@ -52,7 +52,7 @@ default-features = false
 features = ["audio", "nellymoser", "symphonia", "wasm-bindgen"]
 
 [dependencies.web-sys]
-version = "0.3.58"
+version = "0.3.59"
 features = [
     "AddEventListenerOptions", "AudioBuffer", "AudioBufferSourceNode", "AudioContext", "AudioDestinationNode",
     "AudioNode", "AudioParam", "Blob", "BlobPropertyBag", "ChannelMergerNode",
