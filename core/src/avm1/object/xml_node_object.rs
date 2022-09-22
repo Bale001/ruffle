@@ -3,9 +3,9 @@
 use crate::avm1::activation::Activation;
 use crate::avm1::error::Error;
 use crate::avm1::object::TObject;
+use crate::avm1::xml::{XmlNode, TEXT_NODE};
 use crate::avm1::{Object, ScriptObject};
 use crate::impl_custom_object;
-use crate::xml::{XmlNode, TEXT_NODE};
 use gc_arena::{Collect, GcCell, MutationContext};
 use std::fmt;
 

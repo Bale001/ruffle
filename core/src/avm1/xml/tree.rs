@@ -1,11 +1,11 @@
 //! XML Tree structure
 
+use crate::avm1::xml;
 use crate::avm1::Activation;
 use crate::avm1::Attribute;
 use crate::avm1::XmlNodeObject;
 use crate::avm1::{Error, Object, ScriptObject, TObject, Value};
 use crate::string::{AvmString, WStr, WString};
-use crate::xml;
 use gc_arena::{Collect, GcCell, MutationContext};
 use quick_xml::escape::escape;
 use quick_xml::events::BytesStart;

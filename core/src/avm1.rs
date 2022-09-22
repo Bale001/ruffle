@@ -19,6 +19,7 @@ mod property_map;
 mod runtime;
 mod scope;
 mod value;
+mod xml;
 
 #[cfg(test)]
 mod tests;
