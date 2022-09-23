@@ -4,7 +4,8 @@ use crate::avm2::activation::Activation;
 use crate::avm2::object::script_object::ScriptObjectData;
 use crate::avm2::object::{ClassObject, Object, ObjectPtr, TObject};
 use crate::avm2::value::Value;
-use crate::avm2::Error;
+use crate::avm2::xml::{self, Xml};
+use crate::avm2::{Error, QName};
 use gc_arena::{Collect, GcCell, MutationContext};
 use std::cell::{Ref, RefMut};
 
@@ -17,7 +18,14 @@ pub fn xml_allocator<'gc>(
 
     Ok(XmlObject(GcCell::allocate(
         activation.context.gc_context,
-        XmlObjectData { base },
+        XmlObjectData {
+            base,
+            xml: Xml::new(
+                activation.context.gc_context,
+                QName::dynamic_name(""),
+                xml::ELEMENT_NODE,
+            ),
+        },
     ))
     .into())
 }
@@ -31,6 +39,14 @@ pub struct XmlObject<'gc>(GcCell<'gc, XmlObjectData<'gc>>);
 pub struct XmlObjectData<'gc> {
     /// Base script object
     base: ScriptObjectData<'gc>,
+
+    xml: Xml<'gc>,
+}
+
+impl<'gc> XmlObject<'gc> {
+    pub fn as_node(&self) -> Xml<'gc> {
+        self.0.read().xml
+    }
 }
 
 impl<'gc> TObject<'gc> for XmlObject<'gc> {

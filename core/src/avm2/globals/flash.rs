@@ -11,3 +11,4 @@ pub mod system;
 pub mod text;
 pub mod ui;
 pub mod utils;
+pub mod xml;

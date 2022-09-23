@@ -48,6 +48,7 @@ mod traits;
 mod value;
 mod vector;
 mod vtable;
+mod xml;
 
 pub use crate::avm2::activation::Activation;
 pub use crate::avm2::array::ArrayStorage;
