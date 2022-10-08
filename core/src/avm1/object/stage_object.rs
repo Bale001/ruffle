@@ -4,17 +4,16 @@ use crate::avm1::activation::Activation;
 use crate::avm1::error::Error;
 use crate::avm1::property::Attribute;
 use crate::avm1::property_map::PropertyMap;
-use crate::avm1::{Object, ObjectPtr, ScriptObject, TDisplayObject, TObject, Value};
+use crate::avm1::{Object, ObjectPtr, ScriptObject, TObject, Value};
 use crate::avm_warn;
 use crate::context::UpdateContext;
-use crate::display_object::{DisplayObject, EditText, MovieClip, TDisplayObjectContainer};
+use crate::display_object::{
+    DisplayObject, EditText, MovieClip, TDisplayObject, TDisplayObjectContainer,
+};
 use crate::string::{AvmString, WStr};
 use crate::types::Percent;
 use gc_arena::{Collect, GcCell, MutationContext};
 use std::fmt;
-
-/// The type string for MovieClip objects.
-pub const TYPE_OF_MOVIE_CLIP: &str = "movieclip";
 
 /// A ScriptObject that is inherently tied to a display node.
 #[derive(Clone, Copy, Collect)]
@@ -43,17 +42,10 @@ impl<'gc> StageObject<'gc> {
         display_object: DisplayObject<'gc>,
         proto: Option<Object<'gc>>,
     ) -> Self {
-        let mut base = ScriptObject::object(gc_context, proto);
-
-        // MovieClips have a special typeof "movieclip", while others are the default "object".
-        if display_object.as_movie_clip().is_some() {
-            base.set_type_of(gc_context, TYPE_OF_MOVIE_CLIP);
-        }
-
         Self(GcCell::allocate(
             gc_context,
             StageObjectData {
-                base,
+                base: ScriptObject::new(gc_context, proto),
                 display_object,
                 text_field_bindings: Vec::new(),
             },
@@ -105,39 +97,66 @@ impl<'gc> StageObject<'gc> {
         }
     }
 
-    /// Get another level by level name.
-    ///
-    /// Since levels don't have instance names, this function instead parses
-    /// their ID and uses that to retrieve the level.
-    ///
-    /// If the name is a valid level path, it will return the level object
-    /// or `Some(Value::Undefined)` if the level is not occupied.
-    /// Returns `None` if `name` is not a valid level path.
-    fn get_level_by_path(
+    fn resolve_path_property(
+        self,
         name: AvmString<'gc>,
-        context: &mut UpdateContext<'_, 'gc, '_>,
-        case_sensitive: bool,
+        activation: &mut Activation<'_, 'gc, '_>,
     ) -> Option<Value<'gc>> {
-        if let Some(slice) = name.slice(..6) {
-            let level_prefix = WStr::from_units(b"_level");
-            let is_level = if case_sensitive {
-                slice == level_prefix
-            } else {
-                slice.eq_ignore_case(level_prefix)
-            };
-            if is_level {
-                if let Some(level_id) = name.slice(6..).and_then(|v| v.parse::<i32>().ok()) {
-                    let level = context
-                        .stage
-                        .child_by_depth(level_id)
-                        .map(|o| o.object())
-                        .unwrap_or(Value::Undefined);
-                    return Some(level);
-                }
+        let case_sensitive = activation.is_case_sensitive();
+        if name.eq_with_case(b"_root", case_sensitive) {
+            return Some(activation.root_object());
+        } else if name.eq_with_case(b"_parent", case_sensitive) {
+            return Some(
+                self.0
+                    .read()
+                    .display_object
+                    .avm1_parent()
+                    .map(|dn| dn.object().coerce_to_object(activation))
+                    .map(Value::Object)
+                    .unwrap_or(Value::Undefined),
+            );
+        } else if name.eq_with_case(b"_global", case_sensitive) {
+            return Some(activation.context.avm1.global_object());
+        }
+
+        // Resolve level names `_levelN`.
+        if let Some(prefix) = name.slice(..6) {
+            // `_flash` is a synonym of `_level`, a relic from the earliest Flash versions.
+            if prefix.eq_with_case(b"_level", case_sensitive)
+                || prefix.eq_with_case(b"_flash", case_sensitive)
+            {
+                let level_id = Self::parse_level_id(&name[6..]);
+                let level = activation
+                    .context
+                    .stage
+                    .child_by_depth(level_id)
+                    .map(|o| o.object())
+                    .unwrap_or(Value::Undefined);
+                return Some(level);
             }
         }
 
         None
+    }
+
+    fn parse_level_id(digits: &WStr) -> i32 {
+        // TODO: Use `split_first`?
+        let (is_negative, digits) = match digits.get(0) {
+            Some(45) => (true, &digits[1..]),
+            _ => (false, digits),
+        };
+        let mut level_id: i32 = 0;
+        for digit in digits
+            .iter()
+            .map_while(|c| char::from_u32(c.into()).and_then(|c| c.to_digit(10)))
+        {
+            level_id = level_id.wrapping_mul(10);
+            level_id = level_id.wrapping_add(digit as i32);
+        }
+        if is_negative {
+            level_id = level_id.wrapping_neg();
+        }
+        level_id
     }
 }
 
@@ -167,30 +186,39 @@ impl<'gc> TObject<'gc> for StageObject<'gc> {
     ) -> Option<Value<'gc>> {
         let name = name.into();
         let obj = self.0.read();
-        let props = activation.context.avm1.display_properties;
-        let case_sensitive = activation.is_case_sensitive();
+        let props = activation.context.avm1.display_properties();
+
         // Property search order for DisplayObjects:
-        if self.has_own_property(activation, name) {
-            // 1) Actual properties on the underlying object
-            obj.base.get_local_stored(name, activation)
-        } else if let Some(level) =
-            Self::get_level_by_path(name, &mut activation.context, case_sensitive)
-        {
-            // 2) _levelN
-            Some(level)
-        } else if let Some(child) = obj
+        // 1) Actual properties on the underlying object
+        if let Some(value) = obj.base.get_local_stored(name, activation) {
+            return Some(value);
+        }
+
+        // 2) Path properties such as `_root`, `_parent`, `_levelN` (obeys case sensitivity)
+        let magic_property = name.starts_with(b'_');
+        if magic_property {
+            if let Some(object) = self.resolve_path_property(name, activation) {
+                return Some(object);
+            }
+        }
+
+        // 3) Child display objects with the given instance name
+        if let Some(child) = obj
             .display_object
             .as_container()
-            .and_then(|o| o.child_by_name(&name, case_sensitive))
+            .and_then(|o| o.child_by_name(&name, activation.is_case_sensitive()))
         {
-            // 3) Child display objects with the given instance name
-            Some(child.object())
-        } else if let Some(property) = props.read().get_by_name(name) {
-            // 4) Display object properties such as _x, _y
-            Some(property.get(activation, obj.display_object))
-        } else {
-            None
+            return Some(child.object());
         }
+
+        // 4) Display object properties such as `_x`, `_y` (never case sensitive)
+        if magic_property {
+            if let Some(property) = props.read().get_by_name(name) {
+                return Some(property.get(activation, obj.display_object));
+            }
+        }
+
+        None
     }
 
     fn set_local(
@@ -201,7 +229,7 @@ impl<'gc> TObject<'gc> for StageObject<'gc> {
         this: Object<'gc>,
     ) -> Result<(), Error<'gc>> {
         let obj = self.0.read();
-        let props = activation.context.avm1.display_properties;
+        let props = activation.context.avm1.display_properties();
 
         // Check if a text field is bound to this property and update the text if so.
         let case_sensitive = activation.is_case_sensitive();
@@ -212,7 +240,7 @@ impl<'gc> TObject<'gc> for StageObject<'gc> {
                 binding.variable_name.eq_ignore_case(&name)
             }
         }) {
-            let _ = binding.text_field.set_html_text(
+            binding.text_field.set_html_text(
                 &value.coerce_to_string(activation)?,
                 &mut activation.context,
             );
@@ -239,7 +267,7 @@ impl<'gc> TObject<'gc> for StageObject<'gc> {
         &self,
         name: AvmString<'gc>,
         activation: &mut Activation<'_, 'gc, '_>,
-        this: Object<'gc>,
+        this: Value<'gc>,
         args: &[Value<'gc>],
     ) -> Result<Value<'gc>, Error<'gc>> {
         self.0.read().base.call(name, activation, this, args)
@@ -370,13 +398,15 @@ impl<'gc> TObject<'gc> for StageObject<'gc> {
             return true;
         }
 
-        if activation
-            .context
-            .avm1
-            .display_properties
-            .read()
-            .get_by_name(name)
-            .is_some()
+        let magic_property = name.starts_with(b'_');
+        if magic_property
+            && activation
+                .context
+                .avm1
+                .display_properties()
+                .read()
+                .get_by_name(name)
+                .is_some()
         {
             return true;
         }
@@ -391,7 +421,7 @@ impl<'gc> TObject<'gc> for StageObject<'gc> {
             return true;
         }
 
-        if Self::get_level_by_path(name, &mut activation.context, case_sensitive).is_some() {
+        if magic_property && self.resolve_path_property(name, activation).is_some() {
             return true;
         }
 
@@ -480,9 +510,6 @@ impl<'gc> TObject<'gc> for StageObject<'gc> {
             .set_interfaces(gc_context, iface_list)
     }
 
-    fn type_of(&self) -> &'static str {
-        self.0.read().base.type_of()
-    }
     fn as_script_object(&self) -> Option<ScriptObject<'gc>> {
         Some(self.0.read().base)
     }
@@ -645,9 +672,7 @@ fn set_y<'gc>(
 }
 
 fn x_scale<'gc>(activation: &mut Activation<'_, 'gc, '_>, this: DisplayObject<'gc>) -> Value<'gc> {
-    this.scale_x(activation.context.gc_context)
-        .into_fraction()
-        .into()
+    this.scale_x(activation.context.gc_context).percent().into()
 }
 
 fn set_x_scale<'gc>(
@@ -656,15 +681,13 @@ fn set_x_scale<'gc>(
     val: Value<'gc>,
 ) -> Result<(), Error<'gc>> {
     if let Some(val) = property_coerce_to_number(activation, val)? {
-        this.set_scale_x(activation.context.gc_context, Percent::from_fraction(val));
+        this.set_scale_x(activation.context.gc_context, Percent::from(val));
     }
     Ok(())
 }
 
 fn y_scale<'gc>(activation: &mut Activation<'_, 'gc, '_>, this: DisplayObject<'gc>) -> Value<'gc> {
-    this.scale_y(activation.context.gc_context)
-        .into_fraction()
-        .into()
+    this.scale_y(activation.context.gc_context).percent().into()
 }
 
 fn set_y_scale<'gc>(
@@ -673,7 +696,7 @@ fn set_y_scale<'gc>(
     val: Value<'gc>,
 ) -> Result<(), Error<'gc>> {
     if let Some(val) = property_coerce_to_number(activation, val)? {
-        this.set_scale_y(activation.context.gc_context, Percent::from_fraction(val));
+        this.set_scale_y(activation.context.gc_context, Percent::from(val));
     }
     Ok(())
 }

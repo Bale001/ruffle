@@ -1,10 +1,7 @@
 //! `flash.events` namespace
 
-pub mod activityevent;
 pub mod event;
 pub mod eventdispatcher;
-pub mod fullscreenevent;
+pub mod gesture_event;
 pub mod ieventdispatcher;
-pub mod keyboardevent;
-pub mod mouseevent;
-pub mod progressevent;
+pub mod mouse_event;

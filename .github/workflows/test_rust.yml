@@ -9,7 +9,7 @@ on:
 jobs:
   changes:
     name: Paths filter
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     outputs:
       src: ${{ steps.filter.outputs.src }}
     steps:
@@ -32,12 +32,12 @@ jobs:
       fail-fast: false
       matrix:
         rust_version: [stable]
-        os: [ubuntu-latest, windows-latest, macOS-latest]
+        os: [ubuntu-22.04, windows-latest, macos-latest]
         include:
           - rust_version: nightly
-            os: ubuntu-latest
+            os: ubuntu-22.04
           - rust_version: beta
-            os: ubuntu-latest
+            os: ubuntu-22.04
 
     steps:
       - uses: actions/checkout@v2
@@ -51,12 +51,17 @@ jobs:
           components: rustfmt, clippy
 
       - name: Install Linux dependencies
-        if: matrix.os == 'ubuntu-latest'
+        if: runner.os == 'Linux'
         run: |
           sudo add-apt-repository ppa:kisak/kisak-mesa -y
           sudo apt-get update
           sudo apt-get dist-upgrade
-          sudo apt install -y libasound2-dev libxcb-shape0-dev libxcb-xfixes0-dev mesa-vulkan-drivers
+          sudo apt install -y libasound2-dev libxcb-shape0-dev libxcb-xfixes0-dev libgtk-3-dev mesa-vulkan-drivers
+
+      - name: Cache Cargo output
+        uses: Swatinem/rust-cache@90429b3dea365e9a1b0cb82d7f98aabf3089dc63
+        with:
+          shared-key: "desktop"
 
       - name: Check formatting
         uses: actions-rs/cargo@v1
@@ -64,33 +69,49 @@ jobs:
           command: fmt
           args: --all -- --check
 
+      - name: Lint AS3 playerglobals 
+        if: runner.os == 'Linux' && matrix.rust_version == 'stable'
+        uses: actions-rs/cargo@v1
+        with:
+          command: run
+          args: -p build_playerglobal -- lint
+
       - name: Check clippy
         uses: actions-rs/cargo@v1
         with:
           command: clippy
-          args: --all --tests -- -D warnings
+          args: --all --all-features --tests -- -D warnings
+
+      - name: Check documentation
+        uses: actions-rs/cargo@v1
+        with:
+          command: doc
+          args: --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
 
       - name: Run tests with image tests
-        if: matrix.os == 'ubuntu-latest' || matrix.os == 'windows-latest'
+        if: runner.os == 'Linux' || runner.os == 'Windows'
         uses: actions-rs/cargo@v1
         env:
           XDG_RUNTIME_DIR: '' # dummy value, just to silence warnings about it missing
         with:
           command: test
-          args: --features imgtests
+          args: --locked --features imgtests
 
       - name: Run tests without image tests
-        if: ${{ !(matrix.os == 'ubuntu-latest' || matrix.os == 'windows-latest') }}
+        if: ${{ !(runner.os == 'Linux' || runner.os == 'Windows') }}
         uses: actions-rs/cargo@v1
         with:
           command: test
+          args: --locked
 
       - name: Upload images
         if: failure()
         uses: actions/upload-artifact@v2
         with:
           name: swf_images
-          path: tests/**/*.png.updated
+          path: tests*/**/actual*.png
 
   check-required:
     needs: changes
@@ -100,12 +121,12 @@ jobs:
     strategy:
       matrix:
         rust_version: [stable]
-        os: [ubuntu-latest, windows-latest, macOS-latest]
+        os: [ubuntu-22.04, windows-latest, macos-latest]
         include:
           - rust_version: nightly
-            os: ubuntu-latest
+            os: ubuntu-22.04
           - rust_version: beta
-            os: ubuntu-latest
+            os: ubuntu-22.04
 
     steps:
       - name: No-op

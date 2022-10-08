@@ -1,5 +1,7 @@
 use crate::avm1::activation::Activation;
-use crate::avm1::{AvmString, Object, ObjectPtr, TObject, Value};
+use crate::avm1::{Object, ObjectPtr, TObject, Value};
+use crate::string::AvmString;
+use std::fmt::Write;
 
 #[allow(dead_code)]
 pub struct VariableDumper<'a> {
@@ -174,7 +176,9 @@ impl<'a> VariableDumper<'a> {
         self.depth += 1;
 
         for key in keys.into_iter() {
-            self.output.push_str(&format!("{}.{}", name, key));
+            self.output.push_str(name);
+            self.output.push('.');
+            let _ = write!(self.output, "{}", key);
             self.output.push_str(" = ");
             self.print_property(object, key, activation);
             self.output.push('\n');
@@ -258,7 +262,7 @@ mod tests {
     #[test]
     fn dump_empty_object() {
         with_avm(19, |activation, _root| -> Result<(), Error> {
-            let object = ScriptObject::object(activation.context.gc_context, None);
+            let object = ScriptObject::new(activation.context.gc_context, None);
             assert_eq!(
                 VariableDumper::dump(&object.into(), " ", activation),
                 "[object #0] {}"
@@ -270,8 +274,8 @@ mod tests {
     #[test]
     fn dump_object() {
         with_avm(19, |activation, _root| -> Result<(), Error> {
-            let object = ScriptObject::object(activation.context.gc_context, None);
-            let child = ScriptObject::object(activation.context.gc_context, None);
+            let object = ScriptObject::new(activation.context.gc_context, None);
+            let child = ScriptObject::new(activation.context.gc_context, None);
             object.set("self", object.into(), activation)?;
             object.set("test", "value".into(), activation)?;
             object.set("child", child.into(), activation)?;
@@ -288,8 +292,8 @@ mod tests {
     #[test]
     fn dump_variables() {
         with_avm(19, |activation, _root| -> Result<(), Error> {
-            let object = ScriptObject::object(activation.context.gc_context, None);
-            let child = ScriptObject::object(activation.context.gc_context, None);
+            let object = ScriptObject::new(activation.context.gc_context, None);
+            let child = ScriptObject::new(activation.context.gc_context, None);
             object.set("self", object.into(), activation)?;
             object.set("test", "value".into(), activation)?;
             object.set("child", child.into(), activation)?;

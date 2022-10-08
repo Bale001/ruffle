@@ -1,20 +1,18 @@
+use anyhow::{anyhow, Result};
 use clap::Parser;
 use image::RgbaImage;
 use indicatif::{ProgressBar, ProgressStyle};
-use ruffle_core::backend::audio::NullAudioBackend;
-use ruffle_core::backend::locale::NullLocaleBackend;
-use ruffle_core::backend::log::NullLogBackend;
-use ruffle_core::backend::navigator::NullNavigatorBackend;
-use ruffle_core::backend::storage::MemoryStorageBackend;
-use ruffle_core::backend::ui::NullUiBackend;
-use ruffle_core::backend::video::SoftwareVideoBackend;
+use rayon::prelude::*;
+use ruffle_core::limits::ExecutionLimit;
 use ruffle_core::tag_utils::SwfMovie;
-use ruffle_core::Player;
+use ruffle_core::PlayerBuilder;
+use ruffle_render_wgpu::backend::WgpuRenderBackend;
 use ruffle_render_wgpu::clap::{GraphicsBackend, PowerPreference};
+use ruffle_render_wgpu::descriptors::Descriptors;
 use ruffle_render_wgpu::target::TextureTarget;
-use ruffle_render_wgpu::{wgpu, Descriptors, WgpuRenderBackend};
-use std::error::Error;
+use ruffle_render_wgpu::wgpu;
 use std::fs::create_dir_all;
+use std::panic::catch_unwind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use walkdir::{DirEntry, WalkDir};
@@ -38,7 +36,7 @@ struct SizeOpt {
 #[clap(name = "Ruffle Exporter", author, version)]
 struct Opt {
     /// The file or directory of files to export frames from
-    #[clap(name = "swf", parse(from_os_str))]
+    #[clap(name = "swf")]
     swf: PathBuf,
 
     /// The file or directory (if multiple frames/files) to store the capture in.
@@ -46,7 +44,7 @@ struct Opt {
     /// - If given one swf and one frame, the name of the swf + ".png"
     /// - If given one swf and multiple frames, the name of the swf as a directory
     /// - If given multiple swfs, this field is required.
-    #[clap(name = "output", parse(from_os_str))]
+    #[clap(name = "output")]
     output_path: Option<PathBuf>,
 
     /// Number of frames to capture per file
@@ -58,7 +56,7 @@ struct Opt {
     skipframes: u32,
 
     /// Don't show a progress bar
-    #[clap(short, long)]
+    #[clap(short, long, action)]
     silent: bool,
 
     #[clap(flatten)]
@@ -66,29 +64,39 @@ struct Opt {
 
     /// Type of graphics backend to use. Not all options may be supported by your current system.
     /// Default will attempt to pick the most supported graphics backend.
-    #[clap(long, short, ignore_case = true, default_value = "default", arg_enum)]
+    #[clap(long, short, default_value = "default")]
     graphics: GraphicsBackend,
 
     /// Power preference for the graphics device used. High power usage tends to prefer dedicated GPUs,
     /// whereas a low power usage tends prefer integrated GPUs.
-    #[clap(long, short, ignore_case = true, default_value = "high", arg_enum)]
+    #[clap(long, short, default_value = "high")]
     power: PowerPreference,
 
     /// Location to store a wgpu trace output
-    #[clap(long, parse(from_os_str))]
+    #[clap(long)]
     #[cfg(feature = "render_trace")]
     trace_path: Option<PathBuf>,
+
+    /// Skip unsupported movie types (currently AVM 2)
+    #[clap(long, action)]
+    skip_unsupported: bool,
 }
 
+/// Captures a screenshot. The resulting image uses straight alpha
 fn take_screenshot(
-    descriptors: Descriptors,
+    descriptors: Arc<Descriptors>,
     swf_path: &Path,
     frames: u32,
     skipframes: u32,
     progress: &Option<ProgressBar>,
     size: SizeOpt,
-) -> Result<(Descriptors, Vec<RgbaImage>), Box<dyn std::error::Error>> {
-    let movie = SwfMovie::from_path(&swf_path, None)?;
+    skip_unsupported: bool,
+) -> Result<Vec<RgbaImage>> {
+    let movie = SwfMovie::from_path(&swf_path, None).map_err(|e| anyhow!(e.to_string()))?;
+
+    if movie.is_action_script_3() && skip_unsupported {
+        return Err(anyhow!("Skipping unsupported movie"));
+    }
 
     let width = size
         .width
@@ -102,23 +110,15 @@ fn take_screenshot(
         .unwrap_or_else(|| movie.height().to_pixels());
     let height = (height * size.scale).round() as u32;
 
-    let target = TextureTarget::new(&descriptors.device, (width, height));
-    let player = Player::new(
-        Box::new(WgpuRenderBackend::new(descriptors, target)?),
-        Box::new(NullAudioBackend::new()),
-        Box::new(NullNavigatorBackend::new()),
-        Box::new(MemoryStorageBackend::default()),
-        Box::new(NullLocaleBackend::new()),
-        Box::new(SoftwareVideoBackend::new()),
-        Box::new(NullLogBackend::new()),
-        Box::new(NullUiBackend::new()),
-    )?;
-
-    player
-        .lock()
-        .unwrap()
-        .set_viewport_dimensions(width, height, size.scale as f64);
-    player.lock().unwrap().set_root_movie(Arc::new(movie));
+    let target = TextureTarget::new(&descriptors.device, (width, height))
+        .map_err(|e| anyhow!(e.to_string()))?;
+    let player = PlayerBuilder::new()
+        .with_renderer(
+            WgpuRenderBackend::new(descriptors, target).map_err(|e| anyhow!(e.to_string()))?,
+        )
+        .with_movie(movie)
+        .with_viewport_dimensions(width, height, size.scale as f64)
+        .build();
 
     let mut result = Vec::new();
     let totalframes = frames + skipframes;
@@ -131,19 +131,31 @@ fn take_screenshot(
                 i
             ));
         }
+
+        player.lock().unwrap().preload(&mut ExecutionLimit::none());
+
         player.lock().unwrap().run_frame();
         if i >= skipframes {
-            player.lock().unwrap().render();
-            let mut player = player.lock().unwrap();
-            let renderer = player
-                .renderer_mut()
-                .downcast_mut::<WgpuRenderBackend<TextureTarget>>()
-                .unwrap();
-            let target = renderer.target();
-            if let Some(image) = target.capture(renderer.device()) {
-                result.push(image);
-            } else {
-                return Err(format!("Unable to capture frame {} of {:?}", i, swf_path).into());
+            match catch_unwind(|| {
+                player.lock().unwrap().render();
+                let mut player = player.lock().unwrap();
+                let renderer = player
+                    .renderer_mut()
+                    .downcast_mut::<WgpuRenderBackend<TextureTarget>>()
+                    .unwrap();
+                // Use straight alpha
+                renderer.capture_frame(false)
+            }) {
+                Ok(Some(image)) => result.push(image),
+                Ok(None) => return Err(anyhow!("Unable to capture frame {} of {:?}", i, swf_path)),
+                Err(e) => {
+                    return Err(anyhow!(
+                        "Unable to capture frame {} of {:?}: {:?}",
+                        i,
+                        swf_path,
+                        e
+                    ))
+                }
             }
         }
 
@@ -151,17 +163,7 @@ fn take_screenshot(
             progress.inc(1);
         }
     }
-
-    let descriptors = Arc::try_unwrap(player)
-        .ok()
-        .unwrap()
-        .into_inner()?
-        .destroy()
-        .downcast::<WgpuRenderBackend<TextureTarget>>()
-        .ok()
-        .unwrap()
-        .descriptors();
-    Ok((descriptors, result))
+    Ok(result)
 }
 
 fn find_files(root: &Path, with_progress: bool) -> Vec<DirEntry> {
@@ -194,7 +196,7 @@ fn find_files(root: &Path, with_progress: bool) -> Vec<DirEntry> {
     results
 }
 
-fn capture_single_swf(descriptors: Descriptors, opt: &Opt) -> Result<(), Box<dyn Error>> {
+fn capture_single_swf(descriptors: Arc<Descriptors>, opt: &Opt) -> Result<()> {
     let output = opt.output_path.clone().unwrap_or_else(|| {
         let mut result = PathBuf::new();
         result.set_file_name(opt.swf.file_stem().unwrap());
@@ -211,24 +213,25 @@ fn capture_single_swf(descriptors: Descriptors, opt: &Opt) -> Result<(), Box<dyn
     let progress = if !opt.silent {
         let progress = ProgressBar::new(opt.frames as u64);
         progress.set_style(
-            ProgressStyle::default_bar()
-                .template(
-                    "[{elapsed_precise}] {bar:40.cyan/blue} [{eta_precise}] {pos:>7}/{len:7} {msg}",
-                )
-                .progress_chars("##-"),
+            ProgressStyle::with_template(
+                "[{elapsed_precise}] {bar:40.cyan/blue} [{eta_precise}] {pos:>7}/{len:7} {msg}",
+            )
+            .unwrap()
+            .progress_chars("##-"),
         );
         Some(progress)
     } else {
         None
     };
 
-    let (_, frames) = take_screenshot(
+    let frames = take_screenshot(
         descriptors,
         &opt.swf,
         opt.frames,
         opt.skipframes,
         &progress,
         opt.size,
+        opt.skip_unsupported,
     )?;
 
     if let Some(progress) = &progress {
@@ -269,36 +272,26 @@ fn capture_single_swf(descriptors: Descriptors, opt: &Opt) -> Result<(), Box<dyn
     Ok(())
 }
 
-#[allow(unknown_lints, clippy::branches_sharing_code)]
-fn capture_multiple_swfs(mut descriptors: Descriptors, opt: &Opt) -> Result<(), Box<dyn Error>> {
+#[allow(clippy::branches_sharing_code)]
+fn capture_multiple_swfs(descriptors: Arc<Descriptors>, opt: &Opt) -> Result<()> {
     let output = opt.output_path.clone().unwrap();
     let files = find_files(&opt.swf, !opt.silent);
 
     let progress = if !opt.silent {
         let progress = ProgressBar::new((files.len() as u64) * (opt.frames as u64));
         progress.set_style(
-            ProgressStyle::default_bar()
-                .template(
-                    "[{elapsed_precise}] {bar:40.cyan/blue} [{eta_precise}] {pos:>7}/{len:7} {msg}",
-                )
-                .progress_chars("##-"),
+            ProgressStyle::with_template(
+                "[{elapsed_precise}] {bar:40.cyan/blue} [{eta_precise}] {pos:>7}/{len:7} {msg}",
+            )
+            .unwrap()
+            .progress_chars("##-"),
         );
         Some(progress)
     } else {
         None
     };
 
-    for file in &files {
-        let (new_descriptors, frames) = take_screenshot(
-            descriptors,
-            file.path(),
-            opt.frames,
-            opt.skipframes,
-            &progress,
-            opt.size,
-        )?;
-        descriptors = new_descriptors;
-
+    files.par_iter().try_for_each(|file| -> Result<()> {
         if let Some(progress) = &progress {
             progress.set_message(
                 file.path()
@@ -308,33 +301,44 @@ fn capture_multiple_swfs(mut descriptors: Descriptors, opt: &Opt) -> Result<(), 
                     .into_owned(),
             );
         }
+        if let Ok(frames) = take_screenshot(
+            descriptors.clone(),
+            file.path(),
+            opt.frames,
+            opt.skipframes,
+            &progress,
+            opt.size,
+            opt.skip_unsupported,
+        ) {
+            let mut relative_path = file
+                .path()
+                .strip_prefix(&opt.swf)
+                .unwrap_or_else(|_| file.path())
+                .to_path_buf();
 
-        let mut relative_path = file
-            .path()
-            .strip_prefix(&opt.swf)
-            .unwrap_or_else(|_| file.path())
-            .to_path_buf();
-
-        if frames.len() == 1 {
-            let mut destination: PathBuf = (&output).into();
-            relative_path.set_extension("png");
-            destination.push(relative_path);
-            if let Some(parent) = destination.parent() {
-                let _ = create_dir_all(parent);
-            }
-            frames.get(0).unwrap().save(&destination)?;
-        } else {
-            let mut parent: PathBuf = (&output).into();
-            relative_path.set_extension("");
-            parent.push(&relative_path);
-            let _ = create_dir_all(&parent);
-            for (frame, image) in frames.iter().enumerate() {
-                let mut destination = parent.clone();
-                destination.push(format!("{}.png", frame));
-                image.save(&destination)?;
+            if frames.len() == 1 {
+                let mut destination: PathBuf = (&output).into();
+                relative_path.set_extension("png");
+                destination.push(relative_path);
+                if let Some(parent) = destination.parent() {
+                    let _ = create_dir_all(parent);
+                }
+                frames.get(0).unwrap().save(&destination)?;
+            } else {
+                let mut parent: PathBuf = (&output).into();
+                relative_path.set_extension("");
+                parent.push(&relative_path);
+                let _ = create_dir_all(&parent);
+                for (frame, image) in frames.iter().enumerate() {
+                    let mut destination = parent.clone();
+                    destination.push(format!("{}.png", frame));
+                    image.save(&destination)?;
+                }
             }
         }
-    }
+
+        Ok(())
+    })?;
 
     let message = if opt.frames == 1 {
         format!(
@@ -375,7 +379,7 @@ fn trace_path(_opt: &Opt) -> Option<&Path> {
     None
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<()> {
     let opt: Opt = Opt::parse();
     let instance = wgpu::Instance::new(opt.graphics.into());
     let descriptors =
@@ -385,14 +389,19 @@ fn main() -> Result<(), Box<dyn Error>> {
             None,
             opt.power.into(),
             trace_path(&opt),
-        ))?;
+        ))
+        .map_err(|e| anyhow!(e.to_string()))?;
+
+    let descriptors = Arc::new(descriptors);
 
     if opt.swf.is_file() {
         capture_single_swf(descriptors, &opt)?;
     } else if opt.output_path.is_some() {
         capture_multiple_swfs(descriptors, &opt)?;
     } else {
-        return Err("Output directory is required when exporting multiple files.".into());
+        return Err(anyhow!(
+            "Output directory is required when exporting multiple files."
+        ));
     }
 
     Ok(())

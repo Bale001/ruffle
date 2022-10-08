@@ -1,12 +1,14 @@
 //! Object prototype
+
+use crate::avm1::activation::Activation;
 use crate::avm1::error::Error;
 use crate::avm1::function::{Executable, FunctionObject};
 use crate::avm1::property::Attribute;
 use crate::avm1::property_decl::{define_properties_on, Declaration};
-use crate::avm1::{activation::Activation, AvmString};
 use crate::avm1::{Object, ScriptObject, TObject, Value};
 use crate::avm_warn;
 use crate::display_object::TDisplayObject;
+use crate::string::AvmString;
 use gc_arena::MutationContext;
 
 const PROTO_DECLS: &[Declaration] = declare_properties! {
@@ -45,7 +47,7 @@ pub fn object_function<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     let obj = match args.get(0).unwrap_or(&Value::Undefined) {
         Value::Undefined | Value::Null => {
-            Object::from(ScriptObject::object(activation.context.gc_context, None))
+            Object::from(ScriptObject::new(activation.context.gc_context, None))
         }
         val => val.coerce_to_object(activation),
     };
@@ -178,22 +180,12 @@ pub fn register_class<'gc>(
 
     let class_name = class_name.coerce_to_string(activation)?;
 
-    let registry = activation
-        .base_clip()
-        .movie()
-        .map(|movie| activation.context.library.library_for_movie_mut(movie))
-        .and_then(|library| library.avm1_constructor_registry());
-
-    match registry {
-        Some(registry) => {
-            registry.set(class_name, constructor, activation.context.gc_context);
-            Ok(true.into())
-        }
-        None => {
-            log::warn!("Can't register_class without a constructor registry");
-            Ok(false.into())
-        }
-    }
+    activation.context.avm1.register_constructor(
+        activation.base_clip().movie().unwrap().version(),
+        class_name,
+        constructor,
+    );
+    Ok(true.into())
 }
 
 /// Implements `Object.prototype.watch`
@@ -276,10 +268,10 @@ pub fn as_set_prop_flags<'gc>(
         return Ok(Value::Undefined);
     };
 
-    let set_flags = args.get(2).unwrap_or(&0.into()).coerce_to_f64(activation)? as u8;
+    let set_flags = args.get(2).unwrap_or(&0.into()).coerce_to_f64(activation)? as u16;
     let set_attributes = Attribute::from_bits_truncate(set_flags);
 
-    let clear_flags = args.get(3).unwrap_or(&0.into()).coerce_to_f64(activation)? as u8;
+    let clear_flags = args.get(3).unwrap_or(&0.into()).coerce_to_f64(activation)? as u16;
     let clear_attributes = Attribute::from_bits_truncate(clear_flags);
 
     if set_attributes.bits() != set_flags || clear_attributes.bits() != clear_flags {

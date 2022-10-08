@@ -1,5 +1,3 @@
-#![allow(clippy::unusual_byte_groupings)]
-
 use crate::{
     error::{Error, Result},
     string::SwfStr,
@@ -290,7 +288,7 @@ impl<W: Write> Writer<W> {
         Ok(())
     }
 
-    fn write_rectangle(&mut self, rectangle: &Rectangle) -> Result<()> {
+    fn write_rectangle(&mut self, rectangle: &Rectangle<Twips>) -> Result<()> {
         let num_bits = [
             rectangle.x_min,
             rectangle.x_max,
@@ -484,6 +482,7 @@ impl<W: Write> Writer<W> {
                 }
             }
 
+            #[allow(clippy::unusual_byte_groupings)]
             Tag::CsmTextSettings(ref settings) => {
                 self.write_tag_header(TagCode::CsmTextSettings, 12)?;
                 self.write_character_id(settings.id)?;
@@ -667,45 +666,7 @@ impl<W: Write> Writer<W> {
                 }
             }
 
-            Tag::DefineFontInfo(ref font_info) => {
-                let use_wide_codes = self.version >= 6 || font_info.version >= 2;
-
-                let len = font_info.name.len()
-                    + if use_wide_codes { 2 } else { 1 } * font_info.code_table.len()
-                    + if font_info.version >= 2 { 1 } else { 0 }
-                    + 4;
-
-                let tag_id = if font_info.version == 1 {
-                    TagCode::DefineFontInfo
-                } else {
-                    TagCode::DefineFontInfo2
-                };
-                self.write_tag_header(tag_id, len as u32)?;
-                self.write_u16(font_info.id)?;
-
-                // SWF19 has ANSI and Shift-JIS backwards?
-                self.write_u8(font_info.name.len() as u8)?;
-                self.output.write_all(font_info.name.as_bytes())?;
-                self.write_u8(
-                    if font_info.is_small_text { 0b100000 } else { 0 }
-                        | if font_info.is_ansi { 0b10000 } else { 0 }
-                        | if font_info.is_shift_jis { 0b1000 } else { 0 }
-                        | if font_info.is_italic { 0b100 } else { 0 }
-                        | if font_info.is_bold { 0b10 } else { 0 }
-                        | if use_wide_codes { 0b1 } else { 0 },
-                )?;
-                // TODO(Herschel): Assert language is unknown for v1.
-                if font_info.version >= 2 {
-                    self.write_language(font_info.language)?;
-                }
-                for &code in &font_info.code_table {
-                    if use_wide_codes {
-                        self.write_u16(code)?;
-                    } else {
-                        self.write_u8(code as u8)?;
-                    }
-                }
-            }
+            Tag::DefineFontInfo(ref font_info) => self.write_define_font_info(font_info)?,
 
             Tag::DefineFontName {
                 id,
@@ -745,7 +706,7 @@ impl<W: Write> Writer<W> {
             Tag::DoAbc(ref do_abc) => {
                 let len = do_abc.data.len() + do_abc.name.len() + 5;
                 self.write_tag_header(TagCode::DoAbc, len as u32)?;
-                self.write_u32(if do_abc.is_lazy_initialize { 1 } else { 0 })?;
+                self.write_u32(do_abc.flags.bits())?;
                 self.write_string(do_abc.name)?;
                 self.output.write_all(do_abc.data)?;
             }
@@ -838,7 +799,7 @@ impl<W: Write> Writer<W> {
                 self.write_u16(tab_index)?;
             }
 
-            Tag::PlaceObject(ref place_object) => match (*place_object).version {
+            Tag::PlaceObject(ref place_object) => match place_object.version {
                 1 => self.write_place_object(place_object)?,
                 2 => self.write_place_object_2_or_3(place_object, 2)?,
                 3 => self.write_place_object_2_or_3(place_object, 3)?,
@@ -1099,13 +1060,7 @@ impl<W: Write> Writer<W> {
             if data.version >= 2 {
                 writer.write_rectangle(&data.start.edge_bounds)?;
                 writer.write_rectangle(&data.end.edge_bounds)?;
-                writer.write_u8(
-                    if data.has_non_scaling_strokes {
-                        0b10
-                    } else {
-                        0
-                    } | if data.has_scaling_strokes { 0b1 } else { 0 },
-                )?;
+                writer.write_u8(data.flags.bits())?;
             }
 
             // Offset to EndEdges.
@@ -1244,17 +1199,19 @@ impl<W: Write> Writer<W> {
             // TODO(Herschel): Handle overflow.
             self.write_u16(start.width.get() as u16)?;
             self.write_u16(end.width.get() as u16)?;
-            self.write_rgba(&start.color)?;
-            self.write_rgba(&end.color)?;
+            match (&start.fill_style, &end.fill_style) {
+                (FillStyle::Color(start), FillStyle::Color(end)) => {
+                    self.write_rgba(start)?;
+                    self.write_rgba(end)?;
+                }
+                _ => {
+                    return Err(Error::invalid_data(
+                        "Complex line styles can only be used in DefineMorphShape2 tags",
+                    ));
+                }
+            }
         } else {
-            if start.start_cap != end.start_cap
-                || start.join_style != end.join_style
-                || start.allow_scale_x != end.allow_scale_x
-                || start.allow_scale_y != end.allow_scale_y
-                || start.is_pixel_hinted != end.is_pixel_hinted
-                || start.allow_close != end.allow_close
-                || start.end_cap != end.end_cap
-            {
+            if start.flags != end.flags {
                 return Err(Error::invalid_data(
                     "Morph start and end line styles must have the same join parameters.",
                 ));
@@ -1265,41 +1222,21 @@ impl<W: Write> Writer<W> {
             self.write_u16(end.width.get() as u16)?;
 
             // MorphLineStyle2
-            let mut bits = self.bits();
-            bits.write_ubits(2, start.start_cap as u32)?;
-            bits.write_ubits(
-                2,
-                match start.join_style {
-                    LineJoinStyle::Round => 0,
-                    LineJoinStyle::Bevel => 1,
-                    LineJoinStyle::Miter(_) => 2,
-                },
-            )?;
-            bits.write_bit(start.fill_style.is_some())?;
-            bits.write_bit(!start.allow_scale_x)?;
-            bits.write_bit(!start.allow_scale_y)?;
-            bits.write_bit(start.is_pixel_hinted)?;
-            bits.write_ubits(5, 0)?;
-            bits.write_bit(!start.allow_close)?;
-            bits.write_ubits(2, start.end_cap as u32)?;
-            drop(bits);
-            if let LineJoinStyle::Miter(miter_factor) = start.join_style {
+            self.write_u16(start.flags.bits())?;
+            if let LineJoinStyle::Miter(miter_factor) = start.join_style() {
                 self.write_fixed8(miter_factor)?;
             }
-            match (&start.fill_style, &end.fill_style) {
-                (&None, &None) => {
-                    self.write_rgba(&start.color)?;
-                    self.write_rgba(&end.color)?;
-                }
-
-                (&Some(ref start_fill), &Some(ref end_fill)) => {
-                    self.write_morph_fill_style(start_fill, end_fill)?
-                }
-
-                _ => {
-                    return Err(Error::invalid_data(
-                        "Morph start and end line styles must both have fill styles.",
-                    ))
+            if start.flags.contains(LineStyleFlag::HAS_FILL) {
+                self.write_morph_fill_style(&start.fill_style, &end.fill_style)?;
+            } else {
+                match (&start.fill_style, &end.fill_style) {
+                    (FillStyle::Color(start), FillStyle::Color(end)) => {
+                        self.write_rgba(start)?;
+                        self.write_rgba(end)?;
+                    }
+                    _ => {
+                        return Err(Error::invalid_data("Unexpected line fill style fill type"));
+                    }
                 }
             }
         }
@@ -1337,17 +1274,7 @@ impl<W: Write> Writer<W> {
             writer.write_rectangle(&shape.shape_bounds)?;
             if shape.version >= 4 {
                 writer.write_rectangle(&shape.edge_bounds)?;
-                writer.write_u8(
-                    if shape.has_fill_winding_rule {
-                        0b100
-                    } else {
-                        0
-                    } | if shape.has_non_scaling_strokes {
-                        0b10
-                    } else {
-                        0
-                    } | if shape.has_scaling_strokes { 0b1 } else { 0 },
-                )?;
+                writer.write_u8(shape.flags.bits())?;
             }
 
             let (num_fill_bits, num_line_bits) =
@@ -1622,38 +1549,32 @@ impl<W: Write> Writer<W> {
         // TODO(Herschel): Handle overflow.
         self.write_u16(line_style.width.get() as u16)?;
         if shape_version >= 4 {
-            let mut bits = self.bits();
             // LineStyle2
-            bits.write_ubits(2, line_style.start_cap as u32)?;
-            bits.write_ubits(
-                2,
-                match line_style.join_style {
-                    LineJoinStyle::Round => 0,
-                    LineJoinStyle::Bevel => 1,
-                    LineJoinStyle::Miter(_) => 2,
-                },
-            )?;
-            bits.write_bit(line_style.fill_style.is_some())?;
-            bits.write_bit(!line_style.allow_scale_x)?;
-            bits.write_bit(!line_style.allow_scale_y)?;
-            bits.write_bit(line_style.is_pixel_hinted)?;
-            bits.write_ubits(5, 0)?;
-            bits.write_bit(!line_style.allow_close)?;
-            bits.write_ubits(2, line_style.end_cap as u32)?;
-            drop(bits);
-            if let LineJoinStyle::Miter(miter_factor) = line_style.join_style {
+            self.write_u16(line_style.flags.bits())?;
+            if let LineJoinStyle::Miter(miter_factor) = line_style.join_style() {
                 self.write_fixed8(miter_factor)?;
             }
-            match line_style.fill_style {
-                None => self.write_rgba(&line_style.color)?,
-                Some(ref fill) => self.write_fill_style(fill, shape_version)?,
+            if line_style.flags.contains(LineStyleFlag::HAS_FILL) {
+                self.write_fill_style(&line_style.fill_style, shape_version)?;
+            } else if let FillStyle::Color(color) = &line_style.fill_style {
+                self.write_rgba(color)?;
+            } else {
+                return Err(Error::invalid_data("Unexpected line style fill type"));
             }
-        } else if shape_version >= 3 {
-            // LineStyle1 with RGBA
-            self.write_rgba(&line_style.color)?;
         } else {
-            // LineStyle1 with RGB
-            self.write_rgb(&line_style.color)?;
+            // LineStyle1
+            let color = if let FillStyle::Color(color) = &line_style.fill_style {
+                color
+            } else {
+                return Err(Error::invalid_data(
+                    "Complex line styles can only be used in DefineShape4 tags",
+                ));
+            };
+            if shape_version >= 3 {
+                self.write_rgba(color)?
+            } else {
+                self.write_rgb(color)?
+            }
         }
         Ok(())
     }
@@ -1716,70 +1637,54 @@ impl<W: Write> Writer<W> {
         {
             // TODO: Assert version.
             let mut writer = Writer::new(&mut buf, self.version);
-            writer.write_u8(
-                if place_object.clip_actions.is_some() {
-                    0b1000_0000
-                } else {
-                    0
-                } | if place_object.clip_depth.is_some() {
-                    0b0100_0000
-                } else {
-                    0
-                } | if place_object.name.is_some() {
-                    0b0010_0000
-                } else {
-                    0
-                } | if place_object.ratio.is_some() {
-                    0b0001_0000
-                } else {
-                    0
-                } | if place_object.color_transform.is_some() {
-                    0b0000_1000
-                } else {
-                    0
-                } | if place_object.matrix.is_some() {
-                    0b0000_0100
-                } else {
-                    0
-                } | match place_object.action {
-                    PlaceObjectAction::Place(_) => 0b10,
-                    PlaceObjectAction::Modify => 0b01,
-                    PlaceObjectAction::Replace(_) => 0b11,
-                },
-            )?;
+
+            let mut flags = PlaceFlag::empty();
+            flags.set(
+                PlaceFlag::MOVE,
+                matches!(
+                    place_object.action,
+                    PlaceObjectAction::Modify | PlaceObjectAction::Replace(_)
+                ),
+            );
+            flags.set(
+                PlaceFlag::HAS_CHARACTER,
+                matches!(
+                    place_object.action,
+                    PlaceObjectAction::Place(_) | PlaceObjectAction::Replace(_)
+                ),
+            );
+            flags.set(PlaceFlag::HAS_MATRIX, place_object.matrix.is_some());
+            flags.set(
+                PlaceFlag::HAS_COLOR_TRANSFORM,
+                place_object.color_transform.is_some(),
+            );
+            flags.set(PlaceFlag::HAS_RATIO, place_object.ratio.is_some());
+            flags.set(PlaceFlag::HAS_NAME, place_object.name.is_some());
+            flags.set(PlaceFlag::HAS_CLIP_DEPTH, place_object.clip_depth.is_some());
+            flags.set(
+                PlaceFlag::HAS_CLIP_ACTIONS,
+                place_object.clip_actions.is_some(),
+            );
+
             if place_object_version >= 3 {
-                writer.write_u8(
-                    if place_object.background_color.is_some() {
-                        0b100_0000
-                    } else {
-                        0
-                    } | if place_object.is_visible.is_some() {
-                        0b10_0000
-                    } else {
-                        0
-                    } | if place_object.is_image { 0b1_0000 } else { 0 }
-                        | if place_object.class_name.is_some() {
-                            0b1000
-                        } else {
-                            0
-                        }
-                        | if place_object.is_bitmap_cached.is_some() {
-                            0b100
-                        } else {
-                            0
-                        }
-                        | if place_object.blend_mode.is_some() {
-                            0b10
-                        } else {
-                            0
-                        }
-                        | if place_object.filters.is_some() {
-                            0b1
-                        } else {
-                            0
-                        },
-                )?;
+                flags.set(PlaceFlag::HAS_FILTER_LIST, place_object.filters.is_some());
+                flags.set(PlaceFlag::HAS_BLEND_MODE, place_object.blend_mode.is_some());
+                flags.set(
+                    PlaceFlag::HAS_CACHE_AS_BITMAP,
+                    place_object.is_bitmap_cached.is_some(),
+                );
+                flags.set(PlaceFlag::HAS_CLASS_NAME, place_object.class_name.is_some());
+                flags.set(PlaceFlag::HAS_IMAGE, place_object.has_image);
+                flags.set(PlaceFlag::HAS_VISIBLE, place_object.is_visible.is_some());
+                flags.set(
+                    PlaceFlag::OPAQUE_BACKGROUND,
+                    place_object.background_color.is_some(),
+                );
+                writer.write_u16(flags.bits())?;
+            } else {
+                writer.write_u8(flags.bits() as u8)?;
             }
+
             writer.write_u16(place_object.depth)?;
 
             if place_object_version >= 3 {
@@ -2110,7 +2015,7 @@ impl<W: Write> Writer<W> {
             // so that we can calculate their offsets.
             let mut offsets = Vec::with_capacity(num_glyphs);
             let mut has_wide_offsets = false;
-            let has_wide_codes = !font.is_ansi;
+            let has_wide_codes = !font.flags.contains(FontFlag::IS_ANSI);
             let mut shape_buf = Vec::new();
             {
                 let mut shape_writer = Writer::new(&mut shape_buf, self.version);
@@ -2142,16 +2047,7 @@ impl<W: Write> Writer<W> {
 
             let mut writer = Writer::new(&mut buf, self.version);
             writer.write_character_id(font.id)?;
-            writer.write_u8(
-                if font.layout.is_some() { 0b10000000 } else { 0 }
-                    | if font.is_shift_jis { 0b1000000 } else { 0 }
-                    | if font.is_small_text { 0b100000 } else { 0 }
-                    | if font.is_ansi { 0b10000 } else { 0 }
-                    | if has_wide_offsets { 0b1000 } else { 0 }
-                    | if has_wide_codes { 0b100 } else { 0 }
-                    | if font.is_italic { 0b10 } else { 0 }
-                    | if font.is_bold { 0b1 } else { 0 },
-            )?;
+            writer.write_u8(font.flags.bits())?;
             writer.write_language(font.language)?;
             writer.write_u8(font.name.len() as u8)?;
             writer.output.write_all(font.name.as_bytes())?;
@@ -2194,11 +2090,7 @@ impl<W: Write> Writer<W> {
                 writer.write_u16(layout.descent)?;
                 writer.write_i16(layout.leading)?;
                 for glyph in &font.glyphs {
-                    writer.write_i16(
-                        glyph
-                            .advance
-                            .ok_or_else(|| Error::invalid_data("glyph.advance cannot be None"))?,
-                    )?;
+                    writer.write_i16(glyph.advance)?;
                 }
                 for glyph in &font.glyphs {
                     writer.write_rectangle(
@@ -2240,6 +2132,44 @@ impl<W: Write> Writer<W> {
         self.write_string(font.name)?;
         if let Some(data) = font.data {
             self.output.write_all(data)?;
+        }
+        Ok(())
+    }
+
+    fn write_define_font_info(&mut self, font_info: &FontInfo) -> Result<()> {
+        let use_wide_codes = self.version >= 6 || font_info.version >= 2;
+
+        let len = font_info.name.len()
+            + if use_wide_codes { 2 } else { 1 } * font_info.code_table.len()
+            + if font_info.version >= 2 { 1 } else { 0 }
+            + 4;
+
+        let tag_id = if font_info.version == 1 {
+            TagCode::DefineFontInfo
+        } else {
+            TagCode::DefineFontInfo2
+        };
+        self.write_tag_header(tag_id, len as u32)?;
+        self.write_u16(font_info.id)?;
+
+        // SWF19 has ANSI and Shift-JIS backwards?
+        self.write_u8(font_info.name.len() as u8)?;
+        self.output.write_all(font_info.name.as_bytes())?;
+
+        let mut flags = font_info.flags;
+        flags.set(FontInfoFlag::HAS_WIDE_CODES, use_wide_codes);
+        self.write_u8(flags.bits())?;
+
+        // TODO(Herschel): Assert language is unknown for v1.
+        if font_info.version >= 2 {
+            self.write_language(font_info.language)?;
+        }
+        for &code in &font_info.code_table {
+            if use_wide_codes {
+                self.write_u16(code)?;
+            } else {
+                self.write_u8(code as u8)?;
+            }
         }
         Ok(())
     }
@@ -2332,63 +2262,30 @@ impl<W: Write> Writer<W> {
             let mut writer = Writer::new(&mut buf, self.version);
             writer.write_character_id(edit_text.id)?;
             writer.write_rectangle(&edit_text.bounds)?;
-            let flags = if edit_text.initial_text.is_some() {
-                0b10000000
-            } else {
-                0
-            } | if edit_text.is_word_wrap { 0b1000000 } else { 0 }
-                | if edit_text.is_multiline { 0b100000 } else { 0 }
-                | if edit_text.is_password { 0b10000 } else { 0 }
-                | if edit_text.is_read_only { 0b1000 } else { 0 }
-                | if edit_text.color.is_some() { 0b100 } else { 0 }
-                | if edit_text.max_length.is_some() {
-                    0b10
-                } else {
-                    0
-                }
-                | if edit_text.font_id.is_some() { 0b1 } else { 0 };
-            let flags2 = if edit_text.font_class_name.is_some() {
-                0b10000000
-            } else {
-                0
-            } | if edit_text.is_auto_size { 0b1000000 } else { 0 }
-                | if edit_text.layout.is_some() {
-                    0b100000
-                } else {
-                    0
-                }
-                | if !edit_text.is_selectable { 0b10000 } else { 0 }
-                | if edit_text.has_border { 0b1000 } else { 0 }
-                | if edit_text.was_static { 0b100 } else { 0 }
-                | if edit_text.is_html { 0b10 } else { 0 }
-                | if !edit_text.is_device_font { 0b1 } else { 0 };
+            writer.write_u16(edit_text.flags.bits() as u16)?;
 
-            writer.write_u8(flags)?;
-            writer.write_u8(flags2)?;
-
-            if let Some(font_id) = edit_text.font_id {
+            if let Some(font_id) = edit_text.font_id() {
                 writer.write_character_id(font_id)?;
             }
 
             // TODO(Herschel): Check SWF version.
-            if let Some(class) = edit_text.font_class_name {
+            if let Some(class) = edit_text.font_class() {
                 writer.write_string(class)?;
             }
 
-            // TODO(Herschel): Height only exists iff HasFontId, maybe for HasFontClass too?
-            if let Some(height) = edit_text.height {
+            if let Some(height) = edit_text.height() {
                 writer.write_u16(height.get() as u16)?
             }
 
-            if let Some(ref color) = edit_text.color {
+            if let Some(color) = edit_text.color() {
                 writer.write_rgba(color)?
             }
 
-            if let Some(len) = edit_text.max_length {
+            if let Some(len) = edit_text.max_length() {
                 writer.write_u16(len)?;
             }
 
-            if let Some(ref layout) = edit_text.layout {
+            if let Some(layout) = edit_text.layout() {
                 writer.write_u8(layout.align as u8)?;
                 writer.write_u16(layout.left_margin.get() as u16)?; // TODO: Handle overflow
                 writer.write_u16(layout.right_margin.get() as u16)?;
@@ -2397,7 +2294,8 @@ impl<W: Write> Writer<W> {
             }
 
             writer.write_string(edit_text.variable_name)?;
-            if let Some(text) = edit_text.initial_text {
+
+            if let Some(text) = edit_text.initial_text() {
                 writer.write_string(text)?;
             }
         }
@@ -2430,6 +2328,7 @@ impl<W: Write> Writer<W> {
     }
 
     fn write_debug_id(&mut self, debug_id: &DebugId) -> Result<()> {
+        self.write_tag_header(TagCode::DebugId, debug_id.len() as u32)?;
         self.output.write_all(debug_id)?;
         Ok(())
     }
@@ -2509,6 +2408,7 @@ fn count_fbits(n: Fixed16) -> u32 {
 }
 
 #[cfg(test)]
+#[allow(clippy::unusual_byte_groupings)]
 mod tests {
     use super::Writer;
     use super::*;
@@ -2714,7 +2614,7 @@ mod tests {
 
     #[test]
     fn write_rectangle_zero() {
-        let rect: Rectangle = Default::default();
+        let rect: Rectangle<Twips> = Default::default();
         let mut buf = Vec::new();
         {
             let mut writer = Writer::new(&mut buf, 1);

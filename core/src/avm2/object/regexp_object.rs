@@ -13,10 +13,9 @@ use std::cell::{Ref, RefMut};
 /// A class instance allocator that allocates RegExp objects.
 pub fn regexp_allocator<'gc>(
     class: ClassObject<'gc>,
-    proto: Object<'gc>,
     activation: &mut Activation<'_, 'gc, '_>,
-) -> Result<Object<'gc>, Error> {
-    let base = ScriptObjectData::base_new(Some(proto), Some(class));
+) -> Result<Object<'gc>, Error<'gc>> {
+    let base = ScriptObjectData::new(class);
 
     Ok(RegExpObject(GcCell::allocate(
         activation.context.gc_context,
@@ -45,10 +44,9 @@ impl<'gc> RegExpObject<'gc> {
     pub fn from_regexp(
         activation: &mut Activation<'_, 'gc, '_>,
         regexp: RegExp<'gc>,
-    ) -> Result<Object<'gc>, Error> {
+    ) -> Result<Object<'gc>, Error<'gc>> {
         let class = activation.avm2().classes().regexp;
-        let proto = activation.avm2().prototypes().regexp;
-        let base = ScriptObjectData::base_new(Some(proto), Some(class));
+        let base = ScriptObjectData::new(class);
 
         let mut this: Object<'gc> = RegExpObject(GcCell::allocate(
             activation.context.gc_context,
@@ -76,24 +74,14 @@ impl<'gc> TObject<'gc> for RegExpObject<'gc> {
         self.0.as_ptr() as *const ObjectPtr
     }
 
-    fn derive(&self, activation: &mut Activation<'_, 'gc, '_>) -> Result<Object<'gc>, Error> {
-        let base = ScriptObjectData::base_new(Some((*self).into()), None);
-
-        Ok(RegExpObject(GcCell::allocate(
-            activation.context.gc_context,
-            RegExpObjectData {
-                base,
-                regexp: RegExp::new(""),
-            },
-        ))
-        .into())
-    }
-
-    fn to_string(&self, _mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error> {
+    fn to_string(
+        &self,
+        _activation: &mut Activation<'_, 'gc, '_>,
+    ) -> Result<Value<'gc>, Error<'gc>> {
         Ok(Value::Object(Object::from(*self)))
     }
 
-    fn value_of(&self, mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error> {
+    fn value_of(&self, mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error<'gc>> {
         let read = self.0.read();
         let mut s = WString::new();
         s.push_byte(b'/');
@@ -119,6 +107,11 @@ impl<'gc> TObject<'gc> for RegExpObject<'gc> {
         }
 
         Ok(AvmString::new(mc, s).into())
+    }
+
+    /// Unwrap this object as a regexp.
+    fn as_regexp_object(&self) -> Option<RegExpObject<'gc>> {
+        Some(*self)
     }
 
     fn as_regexp(&self) -> Option<Ref<RegExp<'gc>>> {

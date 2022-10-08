@@ -2,24 +2,26 @@
 
 use crate::avm1::activation::Activation;
 use crate::avm1::error::Error;
-use crate::avm1::globals::display_object::{self, AVM_DEPTH_BIAS, AVM_MAX_DEPTH};
 use crate::avm1::globals::matrix::gradient_object_to_matrix;
+use crate::avm1::globals::{self, AVM_DEPTH_BIAS, AVM_MAX_DEPTH};
 use crate::avm1::property_decl::{define_properties_on, Declaration};
 use crate::avm1::{self, Object, ScriptObject, TObject, Value};
 use crate::avm_error;
 use crate::avm_warn;
-use crate::backend::{navigator::NavigationMethod, render};
+use crate::backend::navigator::NavigationMethod;
 use crate::display_object::{
     Bitmap, DisplayObject, EditText, MovieClip, TDisplayObject, TDisplayObjectContainer,
 };
 use crate::ecma_conversions::f64_to_wrapping_i32;
 use crate::prelude::*;
-use crate::shape_utils::DrawCommand;
+use crate::string::AvmString;
 use crate::vminterface::Instantiator;
 use gc_arena::MutationContext;
+use ruffle_render::shape_utils::DrawCommand;
+use std::str::FromStr;
 use swf::{
-    FillStyle, Fixed8, Gradient, GradientInterpolation, GradientRecord, GradientSpread,
-    LineCapStyle, LineJoinStyle, LineStyle, Twips,
+    BlendMode, FillStyle, Fixed8, Gradient, GradientInterpolation, GradientRecord, GradientSpread,
+    LineCapStyle, LineJoinStyle, LineStyle, Rectangle, Twips,
 };
 
 macro_rules! mc_method {
@@ -63,49 +65,52 @@ macro_rules! mc_setter {
 }
 
 const PROTO_DECLS: &[Declaration] = declare_properties! {
-    "attachMovie" => method(mc_method!(attach_movie); DONT_ENUM | DONT_DELETE | READ_ONLY);
-    "createEmptyMovieClip" => method(mc_method!(create_empty_movie_clip); DONT_ENUM | DONT_DELETE | READ_ONLY);
-    "createTextField" => method(mc_method!(create_text_field); DONT_ENUM | DONT_DELETE | READ_ONLY);
-    "duplicateMovieClip" => method(mc_method!(duplicate_movie_clip); DONT_ENUM | DONT_DELETE | READ_ONLY);
-    "getBounds" => method(mc_method!(get_bounds); DONT_ENUM | DONT_DELETE | READ_ONLY);
-    "getBytesLoaded" => method(mc_method!(get_bytes_loaded); DONT_ENUM | DONT_DELETE | READ_ONLY);
-    "getBytesTotal" => method(mc_method!(get_bytes_total); DONT_ENUM | DONT_DELETE | READ_ONLY);
-    "getInstanceAtDepth" => method(mc_method!(get_instance_at_depth); DONT_ENUM | DONT_DELETE | READ_ONLY);
-    "getNextHighestDepth" => method(mc_method!(get_next_highest_depth); DONT_ENUM | DONT_DELETE | READ_ONLY);
-    "getRect" => method(mc_method!(get_rect); DONT_ENUM | DONT_DELETE | READ_ONLY);
-    "getURL" => method(mc_method!(get_url); DONT_ENUM | DONT_DELETE | READ_ONLY);
-    "globalToLocal" => method(mc_method!(global_to_local); DONT_ENUM | DONT_DELETE | READ_ONLY);
-    "gotoAndPlay" => method(mc_method!(goto_and_play); DONT_ENUM | DONT_DELETE | READ_ONLY);
-    "gotoAndStop" => method(mc_method!(goto_and_stop); DONT_ENUM | DONT_DELETE | READ_ONLY);
-    "hitTest" => method(mc_method!(hit_test); DONT_ENUM | DONT_DELETE | READ_ONLY);
-    "loadMovie" => method(mc_method!(load_movie); DONT_ENUM | DONT_DELETE | READ_ONLY);
-    "loadVariables" => method(mc_method!(load_variables); DONT_ENUM | DONT_DELETE | READ_ONLY);
-    "localToGlobal" => method(mc_method!(local_to_global); DONT_ENUM | DONT_DELETE | READ_ONLY);
-    "nextFrame" => method(mc_method!(next_frame); DONT_ENUM | DONT_DELETE | READ_ONLY);
-    "play" => method(mc_method!(play); DONT_ENUM | DONT_DELETE | READ_ONLY);
-    "prevFrame" => method(mc_method!(prev_frame); DONT_ENUM | DONT_DELETE | READ_ONLY);
-    "setMask" => method(mc_method!(set_mask); DONT_ENUM | DONT_DELETE | READ_ONLY);
-    "startDrag" => method(mc_method!(start_drag); DONT_ENUM | DONT_DELETE | READ_ONLY);
-    "stop" => method(mc_method!(stop); DONT_ENUM | DONT_DELETE | READ_ONLY);
-    "stopDrag" => method(mc_method!(stop_drag); DONT_ENUM | DONT_DELETE | READ_ONLY);
-    "swapDepths" => method(mc_method!(swap_depths); DONT_ENUM | DONT_DELETE | READ_ONLY);
-    "unloadMovie" => method(mc_method!(unload_movie); DONT_ENUM | DONT_DELETE | READ_ONLY);
-    "beginFill" => method(mc_method!(begin_fill); DONT_ENUM | DONT_DELETE | READ_ONLY);
-    "beginBitmapFill" => method(mc_method!(begin_bitmap_fill); DONT_ENUM | DONT_DELETE | READ_ONLY);
-    "beginGradientFill" => method(mc_method!(begin_gradient_fill); DONT_ENUM | DONT_DELETE | READ_ONLY);
-    "moveTo" => method(mc_method!(move_to); DONT_ENUM | DONT_DELETE | READ_ONLY);
-    "lineTo" => method(mc_method!(line_to); DONT_ENUM | DONT_DELETE | READ_ONLY);
-    "curveTo" => method(mc_method!(curve_to); DONT_ENUM | DONT_DELETE | READ_ONLY);
-    "endFill" => method(mc_method!(end_fill); DONT_ENUM | DONT_DELETE | READ_ONLY);
-    "lineStyle" => method(mc_method!(line_style); DONT_ENUM | DONT_DELETE | READ_ONLY);
-    "clear" => method(mc_method!(clear); DONT_ENUM | DONT_DELETE | READ_ONLY);
-    "attachBitmap" => method(mc_method!(attach_bitmap); DONT_ENUM | DONT_DELETE | READ_ONLY);
-    "removeMovieClip" => method(remove_movie_clip; DONT_ENUM | DONT_DELETE | READ_ONLY);
-    "transform" => property(mc_getter!(transform), mc_setter!(set_transform); DONT_DELETE | DONT_ENUM);
+    "attachMovie" => method(mc_method!(attach_movie); DONT_ENUM | DONT_DELETE);
+    "createEmptyMovieClip" => method(mc_method!(create_empty_movie_clip); DONT_ENUM | DONT_DELETE; version(6));
+    "createTextField" => method(mc_method!(create_text_field); DONT_ENUM | DONT_DELETE);
+    "duplicateMovieClip" => method(mc_method!(duplicate_movie_clip); DONT_ENUM | DONT_DELETE);
+    "getBounds" => method(mc_method!(get_bounds); DONT_ENUM | DONT_DELETE);
+    "getBytesLoaded" => method(mc_method!(get_bytes_loaded); DONT_ENUM | DONT_DELETE);
+    "getBytesTotal" => method(mc_method!(get_bytes_total); DONT_ENUM | DONT_DELETE);
+    "getDepth" => method(globals::get_depth; DONT_ENUM | DONT_DELETE | READ_ONLY; version(6));
+    "getInstanceAtDepth" => method(mc_method!(get_instance_at_depth); DONT_ENUM | DONT_DELETE; version(7));
+    "getNextHighestDepth" => method(mc_method!(get_next_highest_depth); DONT_ENUM | DONT_DELETE; version(7));
+    "getRect" => method(mc_method!(get_rect); DONT_ENUM | DONT_DELETE; version(8));
+    "getURL" => method(mc_method!(get_url); DONT_ENUM | DONT_DELETE);
+    "globalToLocal" => method(mc_method!(global_to_local); DONT_ENUM | DONT_DELETE);
+    "gotoAndPlay" => method(mc_method!(goto_and_play); DONT_ENUM | DONT_DELETE);
+    "gotoAndStop" => method(mc_method!(goto_and_stop); DONT_ENUM | DONT_DELETE);
+    "hitTest" => method(mc_method!(hit_test); DONT_ENUM | DONT_DELETE);
+    "loadMovie" => method(mc_method!(load_movie); DONT_ENUM | DONT_DELETE);
+    "loadVariables" => method(mc_method!(load_variables); DONT_ENUM | DONT_DELETE);
+    "localToGlobal" => method(mc_method!(local_to_global); DONT_ENUM | DONT_DELETE);
+    "nextFrame" => method(mc_method!(next_frame); DONT_ENUM | DONT_DELETE);
+    "play" => method(mc_method!(play); DONT_ENUM | DONT_DELETE);
+    "prevFrame" => method(mc_method!(prev_frame); DONT_ENUM | DONT_DELETE);
+    "setMask" => method(mc_method!(set_mask); DONT_ENUM | DONT_DELETE; version(6));
+    "startDrag" => method(mc_method!(start_drag); DONT_ENUM | DONT_DELETE);
+    "stop" => method(mc_method!(stop); DONT_ENUM | DONT_DELETE);
+    "stopDrag" => method(mc_method!(stop_drag); DONT_ENUM | DONT_DELETE);
+    "swapDepths" => method(mc_method!(swap_depths); DONT_ENUM | DONT_DELETE);
+    "unloadMovie" => method(mc_method!(unload_movie); DONT_ENUM | DONT_DELETE);
+    "beginFill" => method(mc_method!(begin_fill); DONT_ENUM | DONT_DELETE; version(6));
+    "beginBitmapFill" => method(mc_method!(begin_bitmap_fill); DONT_ENUM | DONT_DELETE; version(8));
+    "beginGradientFill" => method(mc_method!(begin_gradient_fill); DONT_ENUM | DONT_DELETE; version(6));
+    "moveTo" => method(mc_method!(move_to); DONT_ENUM | DONT_DELETE; version(6));
+    "lineTo" => method(mc_method!(line_to); DONT_ENUM | DONT_DELETE; version(6));
+    "curveTo" => method(mc_method!(curve_to); DONT_ENUM | DONT_DELETE; version(6));
+    "endFill" => method(mc_method!(end_fill); DONT_ENUM | DONT_DELETE; version(6));
+    "lineStyle" => method(mc_method!(line_style); DONT_ENUM | DONT_DELETE; version(6));
+    "clear" => method(mc_method!(clear); DONT_ENUM | DONT_DELETE; version(6));
+    "attachBitmap" => method(mc_method!(attach_bitmap); DONT_ENUM | DONT_DELETE; version(8));
+    "removeMovieClip" => method(remove_movie_clip; DONT_ENUM | DONT_DELETE);
+    "transform" => property(mc_getter!(transform), mc_setter!(set_transform); DONT_ENUM; version(8));
     "enabled" => property(mc_getter!(enabled), mc_setter!(set_enabled); DONT_DELETE | DONT_ENUM);
     "focusEnabled" => property(mc_getter!(focus_enabled), mc_setter!(set_focus_enabled); DONT_DELETE | DONT_ENUM);
     "_lockroot" => property(mc_getter!(lock_root), mc_setter!(set_lock_root); DONT_DELETE | DONT_ENUM);
     "useHandCursor" => property(mc_getter!(use_hand_cursor), mc_setter!(set_use_hand_cursor); DONT_DELETE | DONT_ENUM);
+    "blendMode" => property(mc_getter!(blend_mode), mc_setter!(set_blend_mode); DONT_DELETE | DONT_ENUM);
+    "scrollRect" => property(mc_getter!(scroll_rect), mc_setter!(set_scroll_rect); DONT_DELETE | DONT_ENUM; version(8));
 };
 
 /// Implements `MovieClip`
@@ -115,6 +120,67 @@ pub fn constructor<'gc>(
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
     Ok(this.into())
+}
+
+fn new_rectangle<'gc>(
+    activation: &mut Activation<'_, 'gc, '_>,
+    rectangle: Rectangle<Twips>,
+) -> Result<Value<'gc>, Error<'gc>> {
+    let x = rectangle.x_min.to_pixels();
+    let y = rectangle.y_min.to_pixels();
+    let width = (rectangle.x_max - rectangle.x_min).to_pixels();
+    let height = (rectangle.y_max - rectangle.y_min).to_pixels();
+    let args = &[x.into(), y.into(), width.into(), height.into()];
+    let proto = activation.context.avm1.prototypes().rectangle_constructor;
+    proto.construct(activation, args)
+}
+
+fn object_to_rectangle<'gc>(
+    activation: &mut Activation<'_, 'gc, '_>,
+    object: Object<'gc>,
+) -> Result<Option<Rectangle<Twips>>, Error<'gc>> {
+    const NAMES: &[&str] = &["x", "y", "width", "height"];
+    let mut values = [0; 4];
+    for (&name, value) in NAMES.iter().zip(&mut values) {
+        *value = match object.get_local_stored(name, activation) {
+            Some(value) => value.coerce_to_i32(activation)?,
+            None => return Ok(None),
+        }
+    }
+    let [x, y, width, height] = values;
+    Ok(Some(Rectangle {
+        x_min: Twips::from_pixels_i32(x),
+        x_max: Twips::from_pixels_i32(x + width),
+        y_min: Twips::from_pixels_i32(y),
+        y_max: Twips::from_pixels_i32(y + height),
+    }))
+}
+
+fn scroll_rect<'gc>(
+    this: MovieClip<'gc>,
+    activation: &mut Activation<'_, 'gc, '_>,
+) -> Result<Value<'gc>, Error<'gc>> {
+    if this.has_scroll_rect() {
+        new_rectangle(activation, this.next_scroll_rect())
+    } else {
+        Ok(Value::Undefined)
+    }
+}
+
+fn set_scroll_rect<'gc>(
+    this: MovieClip<'gc>,
+    activation: &mut Activation<'_, 'gc, '_>,
+    value: Value<'gc>,
+) -> Result<(), Error<'gc>> {
+    if let Value::Object(object) = value {
+        this.set_has_scroll_rect(activation.context.gc_context, true);
+        if let Some(rectangle) = object_to_rectangle(activation, object)? {
+            this.set_next_scroll_rect(activation.context.gc_context, rectangle);
+        }
+    } else {
+        this.set_has_scroll_rect(activation.context.gc_context, false);
+    };
+    Ok(())
 }
 
 #[allow(clippy::comparison_chain)]
@@ -134,7 +200,7 @@ pub fn hit_test<'gc>(
             // The docs say the point is in "Stage coordinates", but actually they are in root coordinates.
             // root can be moved via _root._x etc., so we actually have to transform from root to world space.
             let point = movie_clip
-                .avm1_root(&activation.context)?
+                .avm1_root()
                 .local_to_global((Twips::from_pixels(x), Twips::from_pixels(y)));
             let ret = if shape {
                 movie_clip.hit_test_shape(
@@ -166,8 +232,7 @@ pub fn create_proto<'gc>(
     proto: Object<'gc>,
     fn_proto: Object<'gc>,
 ) -> Object<'gc> {
-    let object = ScriptObject::object(gc_context, Some(proto));
-    display_object::define_display_object_proto(gc_context, object, fn_proto);
+    let object = ScriptObject::new(gc_context, Some(proto));
     define_properties_on(PROTO_DECLS, gc_context, object, fn_proto);
     object.into()
 }
@@ -221,7 +286,6 @@ fn attach_bitmap<'gc>(
                     );
                     display_object.post_instantiation(
                         &mut activation.context,
-                        display_object.into(),
                         None,
                         Instantiator::Avm1,
                         true,
@@ -252,7 +316,7 @@ fn line_style<'gc>(
                 * 255.0;
             Color::from_rgb(rgb, alpha as u8)
         } else {
-            Color::from_rgb(0, 255)
+            Color::BLACK
         };
         let is_pixel_hinted = args
             .get(3)
@@ -262,10 +326,10 @@ fn line_style<'gc>(
             .and_then(|v| v.coerce_to_string(activation).ok())
             .as_deref()
         {
-            Some(v) if v == b"normal" => (true, true),
+            Some(v) if v == b"none" => (false, false),
             Some(v) if v == b"vertical" => (true, false),
             Some(v) if v == b"horizontal" => (false, true),
-            _ => (false, false),
+            _ => (true, true),
         };
         let cap_style = match args
             .get(5)
@@ -292,21 +356,20 @@ fn line_style<'gc>(
             Some(v) if v == b"bevel" => LineJoinStyle::Bevel,
             _ => LineJoinStyle::Round,
         };
+        let line_style = LineStyle::new()
+            .with_width(width)
+            .with_color(color)
+            .with_start_cap(cap_style)
+            .with_end_cap(cap_style)
+            .with_join_style(join_style)
+            .with_allow_scale_x(allow_scale_x)
+            .with_allow_scale_y(allow_scale_y)
+            .with_is_pixel_hinted(is_pixel_hinted)
+            .with_allow_close(false);
         movie_clip
             .as_drawing(activation.context.gc_context)
             .unwrap()
-            .set_line_style(Some(LineStyle {
-                width,
-                color,
-                start_cap: cap_style,
-                end_cap: cap_style,
-                join_style,
-                fill_style: None,
-                allow_scale_x,
-                allow_scale_y,
-                is_pixel_hinted,
-                allow_close: false,
-            }));
+            .set_line_style(Some(line_style));
     } else {
         movie_clip
             .as_drawing(activation.context.gc_context)
@@ -360,7 +423,7 @@ fn begin_bitmap_fill<'gc>(
         } else {
             return Ok(Value::Undefined);
         };
-        let bitmap = render::BitmapInfo {
+        let bitmap = ruffle_render::bitmap::BitmapInfo {
             handle,
             width: bitmap_data.width() as u16,
             height: bitmap_data.height() as u16,
@@ -377,15 +440,7 @@ fn begin_bitmap_fill<'gc>(
             activation,
         )?;
         // Flash matrix is in pixels. Scale from pixels to twips.
-        const PIXELS_TO_TWIPS: Matrix = Matrix {
-            a: 20.0,
-            b: 0.0,
-            c: 0.0,
-            d: 20.0,
-            tx: Twips::ZERO,
-            ty: Twips::ZERO,
-        };
-        matrix *= PIXELS_TO_TWIPS;
+        matrix *= Matrix::scale(Twips::TWIPS_PER_PIXEL as f32, Twips::TWIPS_PER_PIXEL as f32);
 
         // `repeating` defaults to true, `smoothed` to false.
         // `smoothed` parameter may not be listed in some documentation.
@@ -636,7 +691,7 @@ fn attach_movie<'gc>(
         .context
         .library
         .library_for_movie(movie_clip.movie().unwrap())
-        .ok_or_else(|| "Movie is missing!".into())
+        .ok_or("Movie is missing!")
         .and_then(|l| l.instantiate_by_export_name(export_name, activation.context.gc_context))
     {
         // Set name and attach to parent.
@@ -649,7 +704,6 @@ fn attach_movie<'gc>(
         };
         new_clip.post_instantiation(
             &mut activation.context,
-            new_clip,
             init_object,
             Instantiator::Avm1,
             true,
@@ -693,13 +747,7 @@ fn create_empty_movie_clip<'gc>(
     // Set name and attach to parent.
     new_clip.set_name(activation.context.gc_context, new_instance_name);
     movie_clip.replace_at_depth(&mut activation.context, new_clip.into(), depth);
-    new_clip.post_instantiation(
-        &mut activation.context,
-        new_clip.into(),
-        None,
-        Instantiator::Avm1,
-        true,
-    );
+    new_clip.post_instantiation(&mut activation.context, None, Instantiator::Avm1, true);
 
     Ok(new_clip.object())
 }
@@ -748,13 +796,7 @@ fn create_text_field<'gc>(
         text_field,
         (depth as Depth).wrapping_add(AVM_DEPTH_BIAS),
     );
-    text_field.post_instantiation(
-        &mut activation.context,
-        text_field,
-        None,
-        Instantiator::Avm1,
-        false,
-    );
+    text_field.post_instantiation(&mut activation.context, None, Instantiator::Avm1, false);
 
     if activation.swf_version() >= 8 {
         //SWF8+ returns the `TextField` instance here
@@ -818,7 +860,7 @@ pub fn duplicate_movie_clip_with_bias<'gc>(
             .context
             .library
             .library_for_movie(movie)
-            .ok_or_else(|| "Movie is missing!".into())
+            .ok_or("Movie is missing!")
             .and_then(|l| l.instantiate_by_id(id, activation.context.gc_context))
     } else {
         // Dynamically created clip; create a new empty movie clip.
@@ -831,15 +873,18 @@ pub fn duplicate_movie_clip_with_bias<'gc>(
         parent.replace_at_depth(&mut activation.context, new_clip, depth);
 
         // Copy display properties from previous clip to new clip.
-        new_clip.set_matrix(activation.context.gc_context, &*movie_clip.base().matrix());
-        new_clip.set_color_transform(
-            activation.context.gc_context,
-            &*movie_clip.base().color_transform(),
-        );
-        new_clip.as_movie_clip().unwrap().set_clip_event_handlers(
-            activation.context.gc_context,
-            movie_clip.clip_actions().to_vec(),
-        );
+        let matrix = *movie_clip.base().matrix();
+        new_clip.set_matrix(activation.context.gc_context, matrix);
+
+        let color_transform = *movie_clip.base().color_transform();
+        new_clip.set_color_transform(activation.context.gc_context, color_transform);
+
+        let clip_actions = movie_clip.clip_actions().to_vec();
+        new_clip
+            .as_movie_clip()
+            .unwrap()
+            .set_clip_event_handlers(activation.context.gc_context, clip_actions);
+
         *new_clip.as_drawing(activation.context.gc_context).unwrap() = movie_clip
             .as_drawing(activation.context.gc_context)
             .unwrap()
@@ -850,7 +895,6 @@ pub fn duplicate_movie_clip_with_bias<'gc>(
         let init_object = init_object.map(|v| v.coerce_to_object(activation));
         new_clip.post_instantiation(
             &mut activation.context,
-            new_clip,
             init_object,
             Instantiator::Avm1,
             true,
@@ -872,15 +916,7 @@ fn get_bytes_loaded<'gc>(
     _activation: &mut Activation<'_, 'gc, '_>,
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    let bytes_loaded = if movie_clip.is_root() {
-        movie_clip
-            .movie()
-            .map(|mv| mv.uncompressed_len())
-            .unwrap_or_default()
-    } else {
-        movie_clip.tag_stream_len() as u32
-    };
-    Ok(bytes_loaded.into())
+    Ok(movie_clip.loaded_bytes().into())
 }
 
 fn get_bytes_total<'gc>(
@@ -888,17 +924,7 @@ fn get_bytes_total<'gc>(
     _activation: &mut Activation<'_, 'gc, '_>,
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    // For a loaded SWF, returns the uncompressed size of the SWF.
-    // Otherwise, returns the size of the tag list in the clip's DefineSprite tag.
-    let bytes_total = if movie_clip.is_root() {
-        movie_clip
-            .movie()
-            .map(|mv| mv.uncompressed_len())
-            .unwrap_or_default()
-    } else {
-        movie_clip.tag_stream_len() as u32
-    };
-    Ok(bytes_total.into())
+    Ok(movie_clip.total_bytes().into())
 }
 
 fn get_instance_at_depth<'gc>(
@@ -942,13 +968,10 @@ fn get_next_highest_depth<'gc>(
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
     if activation.swf_version() >= 7 {
-        let depth = std::cmp::max(
-            movie_clip
-                .highest_depth(Depth::MAX)
-                .unwrap_or(0)
-                .wrapping_sub(AVM_DEPTH_BIAS - 1),
-            0,
-        );
+        let depth = movie_clip
+            .highest_depth()
+            .wrapping_sub(AVM_DEPTH_BIAS - 1)
+            .max(0);
         Ok(depth.into())
     } else {
         Ok(Value::Undefined)
@@ -1058,7 +1081,7 @@ fn remove_movie_clip<'gc>(
     // `removeMovieClip` can remove all types of display object,
     // e.g. `MovieClip.prototype.removeMovieClip.apply(textField);`
     if let Some(this) = this.as_display_object() {
-        crate::avm1::globals::display_object::remove_display_object(this, activation);
+        crate::avm1::globals::remove_display_object(this, activation);
     }
 
     Ok(Value::Undefined)
@@ -1089,7 +1112,7 @@ fn start_drag<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    crate::avm1::start_drag(movie_clip.into(), activation, args);
+    crate::avm1::activation::start_drag(movie_clip.into(), activation, args);
     Ok(Value::Undefined)
 }
 
@@ -1108,6 +1131,12 @@ fn stop_drag<'gc>(
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
     // It doesn't matter which clip we call this on; it simply stops any active drag.
+
+    // we might not have had an opportunity to call `update_drag`
+    // if AS did `startDrag(mc);stopDrag();` in one go
+    // so let's do it here
+    crate::player::Player::update_drag(&mut activation.context);
+
     *activation.context.drag_object = None;
     Ok(Value::Undefined)
 }
@@ -1208,12 +1237,7 @@ fn get_bounds<'gc>(
     args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
     let target = match args.get(0) {
-        Some(Value::String(s)) if s.is_empty() => None,
-        Some(Value::Object(o)) if o.as_display_object().is_some() => o.as_display_object(),
-        Some(val) => {
-            let path = val.coerce_to_string(activation)?;
-            activation.resolve_target_display_object(movie_clip.into(), path.into(), false)?
-        }
+        Some(val) => activation.resolve_target_display_object(movie_clip.into(), *val, false)?,
         None => Some(movie_clip.into()),
     };
 
@@ -1233,9 +1257,9 @@ fn get_bounds<'gc>(
             bounds.transform(&bounds_transform)
         };
 
-        let out = ScriptObject::object(
+        let out = ScriptObject::new(
             activation.context.gc_context,
-            Some(activation.context.avm1.prototypes.object),
+            Some(activation.context.avm1.prototypes().object),
         );
         out.set("xMin", out_bounds.x_min.to_pixels().into(), activation)?;
         out.set("yMin", out_bounds.y_min.to_pixels().into(), activation)?;
@@ -1257,7 +1281,6 @@ fn get_rect<'gc>(
     get_bounds(movie_clip, activation, args)
 }
 
-#[allow(unused_must_use)] //can't use errors yet
 pub fn get_url<'gc>(
     _movie_clip: MovieClip<'gc>,
     activation: &mut Activation<'_, 'gc, '_>,
@@ -1271,14 +1294,14 @@ pub fn get_url<'gc>(
         if let Some(fscommand) = fscommand::parse(&url) {
             let fsargs_val = args.get(1).cloned().unwrap_or(Value::Undefined);
             let fsargs = fsargs_val.coerce_to_string(activation)?;
-            fscommand::handle(fscommand, &fsargs, activation);
+            let _ = fscommand::handle(fscommand, &fsargs, activation);
             return Ok(Value::Undefined);
         }
 
         let window = if let Some(window) = args.get(1) {
-            Some(window.coerce_to_string(activation)?.to_string())
+            window.coerce_to_string(activation)?.to_string()
         } else {
-            None
+            "".into()
         };
 
         let method = match args.get(2) {
@@ -1342,18 +1365,15 @@ fn load_movie<'gc>(
     let url = url_val.coerce_to_string(activation)?;
     let method = args.get(1).cloned().unwrap_or(Value::Undefined);
     let method = NavigationMethod::from_method_str(&method.coerce_to_string(activation)?);
-    let (url, opts) = activation.locals_into_request_options(&url, method);
-    let fetch = activation.context.navigator.fetch(&url, opts);
-    let process = activation.context.load_manager.load_movie_into_clip(
-        activation.context.player.clone().unwrap(),
+    let request = activation.locals_into_request(url, method);
+    let future = activation.context.load_manager.load_movie_into_clip(
+        activation.context.player.clone(),
         DisplayObject::MovieClip(target),
-        fetch,
-        url.to_string(),
+        request,
         None,
         None,
     );
-
-    activation.context.navigator.spawn_future(process);
+    activation.context.navigator.spawn_future(future);
 
     Ok(Value::Undefined)
 }
@@ -1367,16 +1387,14 @@ fn load_variables<'gc>(
     let url = url_val.coerce_to_string(activation)?;
     let method = args.get(1).cloned().unwrap_or(Value::Undefined);
     let method = NavigationMethod::from_method_str(&method.coerce_to_string(activation)?);
-    let (url, opts) = activation.locals_into_request_options(&url, method);
-    let fetch = activation.context.navigator.fetch(&url, opts);
+    let request = activation.locals_into_request(url, method);
     let target = target.object().coerce_to_object(activation);
-    let process = activation.context.load_manager.load_form_into_object(
-        activation.context.player.clone().unwrap(),
+    let future = activation.context.load_manager.load_form_into_object(
+        activation.context.player.clone(),
         target,
-        fetch,
+        request,
     );
-
-    activation.context.navigator.spawn_future(process);
+    activation.context.navigator.spawn_future(future);
 
     Ok(Value::Undefined)
 }
@@ -1387,7 +1405,7 @@ fn unload_movie<'gc>(
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
     target.unload(&mut activation.context);
-    target.replace_with_movie(activation.context.gc_context, None);
+    target.replace_with_movie(&mut activation.context, None, None);
 
     Ok(Value::Undefined)
 }
@@ -1396,7 +1414,7 @@ fn transform<'gc>(
     this: MovieClip<'gc>,
     activation: &mut Activation<'_, 'gc, '_>,
 ) -> Result<Value<'gc>, Error<'gc>> {
-    let constructor = activation.context.avm1.prototypes.transform_constructor;
+    let constructor = activation.context.avm1.prototypes().transform_constructor;
     let cloned = constructor.construct(activation, &[this.object()])?;
     Ok(cloned)
 }
@@ -1406,8 +1424,20 @@ fn set_transform<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     value: Value<'gc>,
 ) -> Result<(), Error<'gc>> {
-    let transform = value.coerce_to_object(activation);
-    crate::avm1::globals::transform::apply_to_display_object(activation, transform, this.into())?;
+    if let Value::Object(object) = value {
+        if let Some(transform) = object.as_transform_object() {
+            if let Some(clip) = transform.clip() {
+                let matrix = *clip.base().matrix();
+                this.set_matrix(activation.context.gc_context, matrix);
+
+                let color_transform = *clip.base().color_transform();
+                this.set_color_transform(activation.context.gc_context, color_transform);
+
+                this.set_transformed_by_script(activation.context.gc_context, true);
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1478,5 +1508,29 @@ fn set_use_hand_cursor<'gc>(
 ) -> Result<(), Error<'gc>> {
     let use_hand_cursor = value.as_bool(activation.swf_version());
     this.set_use_hand_cursor(&mut activation.context, use_hand_cursor);
+    Ok(())
+}
+
+fn blend_mode<'gc>(
+    this: MovieClip<'gc>,
+    activation: &mut Activation<'_, 'gc, '_>,
+) -> Result<Value<'gc>, Error<'gc>> {
+    let mode = AvmString::new_utf8(activation.context.gc_context, this.blend_mode().to_string());
+    Ok(mode.into())
+}
+
+fn set_blend_mode<'gc>(
+    this: MovieClip<'gc>,
+    activation: &mut Activation<'_, 'gc, '_>,
+    value: Value<'gc>,
+) -> Result<(), Error<'gc>> {
+    // No-op if value is not a string.
+    if let Value::String(mode) = value {
+        if let Ok(mode) = BlendMode::from_str(&mode.to_string()) {
+            this.set_blend_mode(activation.context.gc_context, mode);
+        } else {
+            log::error!("Unknown blend mode {}", mode);
+        };
+    }
     Ok(())
 }

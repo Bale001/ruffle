@@ -12,10 +12,9 @@ use std::cell::{Ref, RefMut};
 /// A class instance allocator that allocates TextFormat objects.
 pub fn textformat_allocator<'gc>(
     class: ClassObject<'gc>,
-    proto: Object<'gc>,
     activation: &mut Activation<'_, 'gc, '_>,
-) -> Result<Object<'gc>, Error> {
-    let base = ScriptObjectData::base_new(Some(proto), Some(class));
+) -> Result<Object<'gc>, Error<'gc>> {
+    let base = ScriptObjectData::new(class);
 
     Ok(TextFormatObject(GcCell::allocate(
         activation.context.gc_context,
@@ -44,10 +43,9 @@ impl<'gc> TextFormatObject<'gc> {
     pub fn from_text_format(
         activation: &mut Activation<'_, 'gc, '_>,
         text_format: TextFormat,
-    ) -> Result<Object<'gc>, Error> {
+    ) -> Result<Object<'gc>, Error<'gc>> {
         let class = activation.avm2().classes().textformat;
-        let proto = activation.avm2().prototypes().textformat;
-        let base = ScriptObjectData::base_new(Some(proto), Some(class));
+        let base = ScriptObjectData::new(class);
 
         let mut this: Object<'gc> = Self(GcCell::allocate(
             activation.context.gc_context,
@@ -73,20 +71,7 @@ impl<'gc> TObject<'gc> for TextFormatObject<'gc> {
         self.0.as_ptr() as *const ObjectPtr
     }
 
-    fn derive(&self, activation: &mut Activation<'_, 'gc, '_>) -> Result<Object<'gc>, Error> {
-        let base = ScriptObjectData::base_new(Some((*self).into()), None);
-
-        Ok(Self(GcCell::allocate(
-            activation.context.gc_context,
-            TextFormatObjectData {
-                base,
-                text_format: Default::default(),
-            },
-        ))
-        .into())
-    }
-
-    fn value_of(&self, _mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error> {
+    fn value_of(&self, _mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error<'gc>> {
         Ok(Value::Object(Object::from(*self)))
     }
 

@@ -2,15 +2,18 @@
 
 use crate::avm2::activation::Activation;
 use crate::avm2::method::{Method, NativeMethodImpl};
-use crate::avm2::names::{Multiname, Namespace, QName};
 use crate::avm2::object::{ClassObject, Object};
 use crate::avm2::script::TranslationUnit;
 use crate::avm2::traits::{Trait, TraitKind};
 use crate::avm2::value::Value;
 use crate::avm2::Error;
+use crate::avm2::Multiname;
+use crate::avm2::Namespace;
+use crate::avm2::QName;
 use bitflags::bitflags;
 use gc_arena::{Collect, GcCell, MutationContext};
 use std::fmt;
+use std::ops::Deref;
 use swf::avm2::types::{
     Class as AbcClass, Instance as AbcInstance, Method as AbcMethod, MethodBody as AbcMethodBody,
 };
@@ -34,6 +37,76 @@ bitflags! {
     }
 }
 
+/// A helper macro to define public instance properties backed by
+/// private instance slots.
+///
+/// For each (name, type_ns, type_name) pair, this macro
+/// will create a public property named `name` and a private
+/// slot property (in the namespace `NS_RUFFLE_INTERNAL`)
+/// also named `name`. The private slot property will
+/// have the type with namespace `type_ns` and type name `type_name`
+///
+/// The public property will have a generated getter, which passes through
+/// to the generated private slot property.
+/// No setter will be generated
+macro_rules! define_indirect_properties {
+    ($self:expr, $mc:expr, [$(($name:expr, $type_ns:expr, $type_name:expr)),* $(,)?]) => {
+        // Wrap everything in a block expression so that this macro
+        // can be used like a normal function call (e.g. called from any
+        // expression position)
+        {
+        $(
+
+            // We create a closure and immediately call it.
+            // This gives a new scope for imports and function definitions,
+            // which:
+            // * Prevents conflicts between our `use` statements and any
+            //   `use` statements written by the caller.
+            // * Prevents the `getter` function defined in one repetition
+            //   from conflicting with the `getter` function defined in the next
+            //   repetition.
+            (|| {
+                use crate::avm2::traits::Trait;
+                use crate::avm2::globals::NS_RUFFLE_INTERNAL;
+
+                // This needs to be a function pointer so that we can
+                // pass it to `Method::from_builtin`. Therefore, we substitute
+                // $name directly into the function body, rather than writing
+                // a closure and accessing `name` as an upvar.
+                fn getter<'gc>(
+                    activation: &mut Activation<'_, 'gc, '_>,
+                    this: Option<Object<'gc>>,
+                    _args: &[Value<'gc>]
+                ) -> Result<Value<'gc>, Error<'gc>> {
+                    use crate::avm2::Multiname;
+                    use crate::avm2::globals::NS_RUFFLE_INTERNAL;
+
+                    if let Some(this) = this {
+                        return this.get_property(
+                            &Multiname::new(Namespace::Private(NS_RUFFLE_INTERNAL.into()), $name),
+                            activation,
+                        );
+                    }
+                    Ok(Value::Undefined)
+                }
+
+                $self.define_instance_trait(Trait::from_getter(
+                    QName::new(Namespace::public(), $name),
+                    Method::from_builtin(getter, $name, $mc),
+                ));
+
+                $self.define_instance_trait(Trait::from_slot(
+                    QName::new(Namespace::Private(NS_RUFFLE_INTERNAL.into()), $name),
+                    Multiname::new(Namespace::Package($type_ns.into()), $type_name),
+                    None,
+                ));
+            })();
+        )*
+        }
+    }
+}
+pub(crate) use define_indirect_properties;
+
 /// A function that can be used to allocate instances of a class.
 ///
 /// By default, the `implicit_allocator` is used, which attempts to use the base
@@ -46,13 +119,9 @@ bitflags! {
 ///  * `class` - The class object that is being allocated. This must be the
 ///  current class (using a superclass will cause the wrong class to be
 ///  read for traits).
-///  * `proto` - The prototype attached to the class object.
 ///  * `activation` - The current AVM2 activation.
-pub type AllocatorFn = for<'gc> fn(
-    ClassObject<'gc>,
-    Object<'gc>,
-    &mut Activation<'_, 'gc, '_>,
-) -> Result<Object<'gc>, Error>;
+pub type AllocatorFn =
+    for<'gc> fn(ClassObject<'gc>, &mut Activation<'_, 'gc, '_>) -> Result<Object<'gc>, Error<'gc>>;
 
 #[derive(Clone, Collect)]
 #[collect(require_static)]
@@ -130,6 +199,10 @@ pub struct Class<'gc> {
     /// Whether or not the class initializer has already been called.
     class_initializer_called: bool,
 
+    /// The customization point for `Class(args...)` without `new`
+    /// If None, a simple coercion is done.
+    call_handler: Option<Method<'gc>>,
+
     /// The class initializer for specializations of this class.
     ///
     /// Only applies for generic classes. Must be called once and only once
@@ -184,6 +257,7 @@ impl<'gc> Class<'gc> {
                 instance_traits: Vec::new(),
                 class_init,
                 class_initializer_called: false,
+                call_handler: None,
                 class_traits: Vec::new(),
                 specialized_class_init: Method::from_builtin(
                     |_, _, _| Ok(Value::Undefined),
@@ -229,15 +303,15 @@ impl<'gc> Class<'gc> {
         unit: TranslationUnit<'gc>,
         class_index: u32,
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<GcCell<'gc, Self>, Error> {
+    ) -> Result<GcCell<'gc, Self>, Error<'gc>> {
         let abc = unit.abc();
-        let abc_class: Result<&AbcClass, Error> = abc
+        let abc_class: Result<&AbcClass, Error<'gc>> = abc
             .classes
             .get(class_index as usize)
             .ok_or_else(|| "LoadError: Class index not valid".into());
         let abc_class = abc_class?;
 
-        let abc_instance: Result<&AbcInstance, Error> = abc
+        let abc_instance: Result<&AbcInstance, Error<'gc>> = abc
             .instances
             .get(class_index as usize)
             .ok_or_else(|| "LoadError: Instance index not valid".into());
@@ -248,11 +322,11 @@ impl<'gc> Class<'gc> {
         let super_class = if abc_instance.super_name.0 == 0 {
             None
         } else {
-            Some(Multiname::from_abc_multiname_static(
-                unit,
-                abc_instance.super_name,
-                activation.context.gc_context,
-            )?)
+            Some(
+                unit.pool_multiname_static(abc_instance.super_name, activation.context.gc_context)?
+                    .deref()
+                    .clone(),
+            )
         };
 
         let protected_namespace = if let Some(ns) = &abc_instance.protected_namespace {
@@ -267,11 +341,11 @@ impl<'gc> Class<'gc> {
 
         let mut interfaces = Vec::with_capacity(abc_instance.interfaces.len());
         for interface_name in &abc_instance.interfaces {
-            interfaces.push(Multiname::from_abc_multiname_static(
-                unit,
-                *interface_name,
-                activation.context.gc_context,
-            )?);
+            interfaces.push(
+                unit.pool_multiname_static(*interface_name, activation.context.gc_context)?
+                    .deref()
+                    .clone(),
+            );
         }
 
         let instance_init = unit.load_method(abc_instance.init_method, false, activation)?;
@@ -283,6 +357,16 @@ impl<'gc> Class<'gc> {
         attributes.set(ClassAttributes::FINAL, abc_instance.is_final);
         attributes.set(ClassAttributes::INTERFACE, abc_instance.is_interface);
 
+        let mut instance_allocator = None;
+
+        // When loading a class from our playerglobal, grab the corresponding native
+        // allocator function from the table (which may be `None`)
+        if unit.domain().is_avm2_global_domain(activation) {
+            instance_allocator = activation.avm2().native_instance_allocator_table
+                [class_index as usize]
+                .map(|(_name, ptr)| Allocator(ptr));
+        }
+
         Ok(GcCell::allocate(
             activation.context.gc_context,
             Self {
@@ -292,12 +376,13 @@ impl<'gc> Class<'gc> {
                 attributes,
                 protected_namespace,
                 interfaces,
-                instance_allocator: None,
+                instance_allocator,
                 instance_init,
                 native_instance_init,
                 instance_traits: Vec::new(),
                 class_init,
                 class_initializer_called: false,
+                call_handler: None,
                 class_traits: Vec::new(),
                 specialized_class_init: Method::from_builtin(
                     |_, _, _| Ok(Value::Undefined),
@@ -321,7 +406,7 @@ impl<'gc> Class<'gc> {
         unit: TranslationUnit<'gc>,
         class_index: u32,
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), Error<'gc>> {
         if self.traits_loaded {
             return Ok(());
         }
@@ -329,13 +414,13 @@ impl<'gc> Class<'gc> {
         self.traits_loaded = true;
 
         let abc = unit.abc();
-        let abc_class: Result<&AbcClass, Error> = abc
+        let abc_class: Result<&AbcClass, Error<'gc>> = abc
             .classes
             .get(class_index as usize)
             .ok_or_else(|| "LoadError: Class index not valid".into());
         let abc_class = abc_class?;
 
-        let abc_instance: Result<&AbcInstance, Error> = abc
+        let abc_instance: Result<&AbcInstance, Error<'gc>> = abc
             .instances
             .get(class_index as usize)
             .ok_or_else(|| "LoadError: Instance index not valid".into());
@@ -359,7 +444,7 @@ impl<'gc> Class<'gc> {
     /// This should be called at class creation time once the superclass name
     /// has been resolved. It will return Ok for a valid class, and a
     /// VerifyError for any invalid class.
-    pub fn validate_class(&self, superclass: Option<ClassObject<'gc>>) -> Result<(), Error> {
+    pub fn validate_class(&self, superclass: Option<ClassObject<'gc>>) -> Result<(), Error<'gc>> {
         // System classes do not throw verify errors.
         if self.is_system {
             return Ok(());
@@ -428,7 +513,7 @@ impl<'gc> Class<'gc> {
         translation_unit: TranslationUnit<'gc>,
         method: &AbcMethod,
         body: &AbcMethodBody,
-    ) -> Result<GcCell<'gc, Self>, Error> {
+    ) -> Result<GcCell<'gc, Self>, Error<'gc>> {
         let name =
             translation_unit.pool_string(method.name.as_u30(), activation.context.gc_context)?;
         let mut traits = Vec::with_capacity(body.traits.len());
@@ -473,6 +558,7 @@ impl<'gc> Class<'gc> {
                     activation.context.gc_context,
                 ),
                 class_initializer_called: false,
+                call_handler: None,
                 class_traits: Vec::new(),
                 traits_loaded: true,
                 is_system: false,
@@ -504,7 +590,7 @@ impl<'gc> Class<'gc> {
         for &(name, value) in items {
             self.define_class_trait(Trait::from_const(
                 QName::new(Namespace::public(), name),
-                QName::new(Namespace::public(), "String").into(),
+                Multiname::public("String"),
                 Some(value.into()),
             ));
         }
@@ -514,7 +600,7 @@ impl<'gc> Class<'gc> {
         for &(name, value) in items {
             self.define_class_trait(Trait::from_const(
                 QName::new(Namespace::public(), name),
-                QName::new(Namespace::public(), "Number").into(),
+                Multiname::public("Number"),
                 Some(value.into()),
             ));
         }
@@ -524,7 +610,7 @@ impl<'gc> Class<'gc> {
         for &(name, value) in items {
             self.define_class_trait(Trait::from_const(
                 QName::new(Namespace::public(), name),
-                QName::new(Namespace::public(), "uint").into(),
+                Multiname::public("uint"),
                 Some(value.into()),
             ));
         }
@@ -534,7 +620,7 @@ impl<'gc> Class<'gc> {
         for &(name, value) in items {
             self.define_class_trait(Trait::from_const(
                 QName::new(Namespace::public(), name),
-                QName::new(Namespace::public(), "int").into(),
+                Multiname::public("int"),
                 Some(value.into()),
             ));
         }
@@ -663,11 +749,40 @@ impl<'gc> Class<'gc> {
         for &(name, value) in items {
             self.define_instance_trait(Trait::from_slot(
                 QName::new(Namespace::public(), name),
-                QName::new(Namespace::public(), "Number").into(),
+                Multiname::public("Number"),
                 value.map(|v| v.into()),
             ));
         }
     }
+
+    #[inline(never)]
+    pub fn define_public_slot_instance_traits(
+        &mut self,
+        items: &[(&'static str, &'static str, &'static str)],
+    ) {
+        for &(name, type_ns, type_name) in items {
+            self.define_instance_trait(Trait::from_slot(
+                QName::new(Namespace::public(), name),
+                Multiname::new(Namespace::Package(type_ns.into()), type_name),
+                None,
+            ));
+        }
+    }
+
+    #[inline(never)]
+    pub fn define_public_slot_instance_traits_type_multiname(
+        &mut self,
+        items: &[(&'static str, Multiname<'gc>)],
+    ) {
+        for (name, type_name) in items {
+            self.define_instance_trait(Trait::from_slot(
+                QName::new(Namespace::public(), *name),
+                type_name.clone(),
+                None,
+            ));
+        }
+    }
+
     #[inline(never)]
     pub fn define_private_slot_instance_traits(
         &mut self,
@@ -676,7 +791,7 @@ impl<'gc> Class<'gc> {
         for &(ns, name, type_ns, type_name) in items {
             self.define_instance_trait(Trait::from_slot(
                 QName::new(Namespace::Private(ns.into()), name),
-                QName::new(Namespace::Package(type_ns.into()), type_name).into(),
+                Multiname::new(Namespace::Package(type_ns.into()), type_name),
                 None,
             ));
         }
@@ -739,6 +854,16 @@ impl<'gc> Class<'gc> {
     /// Get this class's class initializer.
     pub fn class_init(&self) -> Method<'gc> {
         self.class_init.clone()
+    }
+
+    /// Set a call handler for this class.
+    pub fn set_call_handler(&mut self, new_call_handler: Method<'gc>) {
+        self.call_handler = Some(new_call_handler);
+    }
+
+    /// Get this class's call handler.
+    pub fn call_handler(&self) -> Option<Method<'gc>> {
+        self.call_handler.clone()
     }
 
     /// Check if the class has already been initialized.

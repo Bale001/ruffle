@@ -6,6 +6,7 @@ use crate::avm1::error::Error;
 use crate::avm1::property_decl::{define_properties_on, Declaration};
 use crate::avm1::{Object, ScriptObject, SoundObject, TObject, Value};
 use crate::avm_warn;
+use crate::backend::navigator::Request;
 use crate::character::Character;
 use crate::display_object::{SoundTransform, TDisplayObject};
 use gc_arena::MutationContext;
@@ -38,10 +39,12 @@ pub fn constructor<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     // 1st parameter is the movie clip that "owns" all sounds started by this object.
     // `Sound.setTransform`, `Sound.stop`, etc. will affect all sounds owned by this clip.
-    let owner = args
-        .get(0)
-        .map(|o| o.coerce_to_object(activation))
-        .and_then(|o| o.as_display_object());
+    let owner = if let Some(owner) = args.get(0) {
+        let start_clip = activation.target_clip_or_root();
+        activation.resolve_target_display_object(start_clip, *owner, false)?
+    } else {
+        None
+    };
 
     if let Some(sound) = this.as_sound_object() {
         sound.set_owner(activation.context.gc_context, owner);
@@ -83,6 +86,7 @@ fn attach_sound<'gc>(
                 .character_by_export_name(name)
             {
                 sound_object.set_sound(activation.context.gc_context, Some(*sound));
+                sound_object.set_is_streaming(activation.context.gc_context, false);
                 sound_object.set_duration(
                     activation.context.gc_context,
                     activation
@@ -191,11 +195,11 @@ fn get_transform<'gc>(
     });
 
     if let Some(transform) = transform {
-        let obj = ScriptObject::object(
+        let obj = ScriptObject::new(
             activation.context.gc_context,
-            Some(activation.context.avm1.prototypes.object),
+            Some(activation.context.avm1.prototypes().object),
         );
-        // Surprisngly `lr` means "right-to-left" and `rl` means "left-to-right".
+        // Surprisingly `lr` means "right-to-left" and `rl` means "left-to-right".
         obj.set("ll", transform.left_to_left.into(), activation)?;
         obj.set("lr", transform.right_to_left.into(), activation)?;
         obj.set("rl", transform.left_to_right.into(), activation)?;
@@ -238,11 +242,32 @@ fn id3<'gc>(
 
 fn load_sound<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
-    _this: Object<'gc>,
-    _args: &[Value<'gc>],
+    this: Object<'gc>,
+    args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    if activation.swf_version() >= 6 {
-        avm_warn!(activation, "Sound.loadSound: Unimplemented");
+    if let Some(sound) = this.as_sound_object() {
+        if let Some(url) = args.get(0) {
+            let url = url.coerce_to_string(activation)?;
+            let is_streaming = args
+                .get(1)
+                .unwrap_or(&Value::Undefined)
+                .as_bool(activation.swf_version());
+            if is_streaming {
+                // Streaming MP3s can only have a single active instance.
+                // (Previous `attachSound` instances will continue to play.)
+                if let Some(sound_instance) = sound.sound_instance() {
+                    activation.context.stop_sound(sound_instance);
+                }
+            }
+            sound.set_is_streaming(activation.context.gc_context, is_streaming);
+            let future = activation.context.load_manager.load_sound_avm1(
+                activation.context.player.clone(),
+                sound,
+                Request::get(url.to_utf8_lossy().into_owned()),
+                is_streaming,
+            );
+            activation.context.navigator.spawn_future(future);
+        }
     }
     Ok(Value::Undefined)
 }
@@ -307,7 +332,7 @@ fn set_transform<'gc>(
         if obj.has_own_property(activation, "ll".into()) {
             transform.left_to_left = obj.get("ll", activation)?.coerce_to_i32(activation)?;
         }
-        // Surprisngly `lr` means "right-to-left" and `rl` means "left-to-right".
+        // Surprisingly `lr` means "right-to-left" and `rl` means "left-to-right".
         if obj.has_own_property(activation, "rl".into()) {
             transform.left_to_right = obj.get("rl", activation)?.coerce_to_i32(activation)?;
         }
@@ -354,7 +379,7 @@ fn set_volume<'gc>(
     Ok(Value::Undefined)
 }
 
-fn start<'gc>(
+pub fn start<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     this: Object<'gc>,
     args: &[Value<'gc>],
@@ -368,6 +393,12 @@ fn start<'gc>(
     use swf::{SoundEvent, SoundInfo};
     if let Some(sound_object) = this.as_sound_object() {
         if let Some(sound) = sound_object.sound() {
+            if sound_object.is_streaming() {
+                // Streaming MP3s can only have a single active instance.
+                if let Some(sound_instance) = sound_object.sound_instance() {
+                    activation.context.stop_sound(sound_instance);
+                }
+            }
             let sound_instance = activation.context.start_sound(
                 sound,
                 &SoundInfo {

@@ -4,7 +4,6 @@ use wgpu::util::DeviceExt;
 
 #[derive(Debug)]
 pub struct Globals {
-    layout: wgpu::BindGroupLayout,
     bind_group: wgpu::BindGroup,
     buffer: wgpu::Buffer,
     viewport_width: u32,
@@ -19,22 +18,7 @@ struct GlobalsUniform {
 }
 
 impl Globals {
-    pub fn new(device: &wgpu::Device) -> Self {
-        let layout_label = create_debug_label!("Globals bind group layout");
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: layout_label.as_deref(),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
-
+    pub fn new(device: &wgpu::Device, layout: &wgpu::BindGroupLayout) -> Self {
         let buffer_label = create_debug_label!("Globals buffer");
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: buffer_label.as_deref(),
@@ -58,13 +42,16 @@ impl Globals {
         });
 
         Self {
-            layout,
             bind_group,
             buffer,
             viewport_width: 0,
             viewport_height: 0,
             dirty: true,
         }
+    }
+
+    pub fn resolution(&self) -> (u32, u32) {
+        (self.viewport_width, self.viewport_height)
     }
 
     pub fn set_resolution(&mut self, viewport_width: u32, viewport_height: u32) {
@@ -101,10 +88,6 @@ impl Globals {
             0,
             std::mem::size_of::<GlobalsUniform>() as u64,
         );
-    }
-
-    pub fn layout(&self) -> &wgpu::BindGroupLayout {
-        &self.layout
     }
 
     pub fn bind_group(&self) -> &wgpu::BindGroup {

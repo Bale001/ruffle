@@ -1,11 +1,13 @@
 //! AVM2 values
 
 use crate::avm2::activation::Activation;
-use crate::avm2::names::Namespace;
-use crate::avm2::names::QName;
+use crate::avm2::globals::NS_VECTOR;
 use crate::avm2::object::{ClassObject, NamespaceObject, Object, PrimitiveObject, TObject};
 use crate::avm2::script::TranslationUnit;
 use crate::avm2::Error;
+use crate::avm2::Multiname;
+use crate::avm2::Namespace;
+use crate::avm2::QName;
 use crate::ecma_conversions::{f64_to_wrapping_i32, f64_to_wrapping_u32};
 use crate::string::{AvmString, WStr};
 use gc_arena::{Collect, MutationContext};
@@ -35,11 +37,25 @@ pub enum Value<'gc> {
     Null,
     Bool(bool),
     Number(f64),
-    Unsigned(u32),
+    // note: this value should never reach +/- 1<<28; this is currently not enforced (TODO).
+    // Ruffle currently won't break if you break that invariant,
+    // but some FP compatibility edge cases depend on it, so we should do this at some point.
     Integer(i32),
     String(AvmString<'gc>),
     Object(Object<'gc>),
 }
+
+// This type is used very frequently, so make sure it doesn't unexpectedly grow.
+// For now, we only test on Nightly, since a new niche optimization was recently
+// added (https://github.com/rust-lang/rust/pull/94075) that shrinks the size
+// relative to stable.
+
+#[cfg(target_arch = "wasm32")]
+static_assertions::assert_eq_size!(Value<'_>, [u8; 16]);
+
+#[rustversion::nightly]
+#[cfg(target_pointer_width = "64")]
+static_assertions::assert_eq_size!(Value<'_>, [u8; 24]);
 
 impl<'gc> From<AvmString<'gc>> for Value<'gc> {
     fn from(string: AvmString<'gc>) -> Self {
@@ -82,7 +98,13 @@ impl<'gc> From<f32> for Value<'gc> {
 
 impl<'gc> From<u8> for Value<'gc> {
     fn from(value: u8) -> Self {
-        Value::Unsigned(u32::from(value))
+        Value::Integer(i32::from(value))
+    }
+}
+
+impl<'gc> From<i8> for Value<'gc> {
+    fn from(value: i8) -> Self {
+        Value::Integer(i32::from(value))
     }
 }
 
@@ -94,19 +116,27 @@ impl<'gc> From<i16> for Value<'gc> {
 
 impl<'gc> From<u16> for Value<'gc> {
     fn from(value: u16) -> Self {
-        Value::Unsigned(u32::from(value))
+        Value::Integer(i32::from(value))
     }
 }
 
 impl<'gc> From<i32> for Value<'gc> {
     fn from(value: i32) -> Self {
-        Value::Integer(value)
+        if value >= (1 << 28) || value < -(1 << 28) {
+            Value::Number(value as f64)
+        } else {
+            Value::Integer(value)
+        }
     }
 }
 
 impl<'gc> From<u32> for Value<'gc> {
     fn from(value: u32) -> Self {
-        Value::Unsigned(value)
+        if value >= (1 << 28) {
+            Value::Number(value as f64)
+        } else {
+            Value::Integer(value as i32)
+        }
     }
 }
 
@@ -123,13 +153,8 @@ impl PartialEq for Value<'_> {
             (Value::Null, Value::Null) => true,
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Number(a), Value::Number(b)) => a == b,
-            (Value::Number(a), Value::Unsigned(b)) => *a == *b as f64,
             (Value::Number(a), Value::Integer(b)) => *a == *b as f64,
-            (Value::Unsigned(a), Value::Number(b)) => *a as f64 == *b,
-            (Value::Unsigned(a), Value::Unsigned(b)) => a == b,
-            (Value::Unsigned(a), Value::Integer(b)) => *a as i64 == *b as i64,
             (Value::Integer(a), Value::Number(b)) => *a as f64 == *b,
-            (Value::Integer(a), Value::Unsigned(b)) => *a as i64 == *b as i64,
             (Value::Integer(a), Value::Integer(b)) => a == b,
             (Value::String(a), Value::String(b)) => a == b,
             (Value::Object(a), Value::Object(b)) => Object::ptr_eq(*a, *b),
@@ -138,7 +163,300 @@ impl PartialEq for Value<'_> {
     }
 }
 
-pub fn abc_int(translation_unit: TranslationUnit<'_>, index: Index<i32>) -> Result<i32, Error> {
+/// Strips leading whitespace.
+fn skip_spaces(s: &mut &WStr) {
+    *s = s.trim_start_matches(|c| {
+        matches!(
+            c,
+            0x20 | 0x09 | 0x0d | 0x0a | 0x0c | 0x0b | 0x2000
+                ..=0x200b | 0x2028 | 0x2029 | 0x205f | 0x3000
+        )
+    });
+}
+
+/// Consumes an optional sign character.
+/// Returns whether a minus sign was consumed.
+fn parse_sign(s: &mut &WStr) -> bool {
+    if let Some(after_sign) = s.strip_prefix(b'-') {
+        *s = after_sign;
+        true
+    } else if let Some(after_sign) = s.strip_prefix(b'+') {
+        *s = after_sign;
+        false
+    } else {
+        false
+    }
+}
+
+/// Converts a `WStr` to an integer (as an `f64`).
+///
+/// This function might fail for some invalid inputs, by returning `f64::NAN`.
+///
+/// `radix` is only valid in the range `2..=36`, plus the special `0` value, which means the
+/// radix is inferred from the string; hexadecimal if it starts with a `0x` prefix (case
+/// insensitive), or decimal otherwise.
+/// `strict` tells whether to fail on trailing garbage, or ignore it.
+pub fn string_to_int(mut s: &WStr, mut radix: i32, strict: bool) -> f64 {
+    // Allow leading whitespace.
+    skip_spaces(&mut s);
+
+    let is_negative = parse_sign(&mut s);
+
+    if radix == 16 || radix == 0 {
+        if let Some(after_0x) = s
+            .strip_prefix(WStr::from_units(b"0x"))
+            .or_else(|| s.strip_prefix(WStr::from_units(b"0X")))
+        {
+            // Consume hexadecimal prefix.
+            s = after_0x;
+
+            // Explicit hexadecimal.
+            radix = 16;
+        } else if radix == 0 {
+            // Default to decimal.
+            radix = 10;
+        }
+    }
+
+    // Fail on invalid radix or blank string.
+    if !(2..=36).contains(&radix) || s.is_empty() {
+        return f64::NAN;
+    }
+
+    // Actual number parsing.
+    let mut result = 0.0;
+    let start = s;
+    s = s.trim_start_matches(|c| {
+        match u8::try_from(c)
+            .ok()
+            .and_then(|c| char::from(c).to_digit(radix as u32))
+        {
+            Some(digit) => {
+                result *= f64::from(radix);
+                result += f64::from(digit);
+                true
+            }
+            None => false,
+        }
+    });
+
+    // Fail if we got no digits.
+    // TODO: Compare by reference instead?
+    if s.len() == start.len() {
+        return f64::NAN;
+    }
+
+    if strict {
+        // Allow trailing whitespace.
+        skip_spaces(&mut s);
+
+        // Fail if we got digits, but we're in strict mode and not at end of string.
+        if !s.is_empty() {
+            return f64::NAN;
+        }
+    }
+
+    // Apply sign.
+    if is_negative {
+        result = -result;
+    }
+
+    // We should only return integers and +/-Infinity.
+    debug_assert!(result.is_infinite() || result.fract() == 0.0);
+    result
+}
+
+/// Converts a `WStr` to an `f64`.
+///
+/// This function might fail for some invalid inputs, by returning `None`.
+///
+/// `strict` typically tells whether to behave like `Number()` or `parseFloat()`:
+/// * `strict == true` fails on trailing garbage, but interprets blank strings (which are empty or consist only of whitespace) as zero.
+/// * `strict == false` ignores trailing garbage, but fails on blank strings.
+pub fn string_to_f64(mut s: &WStr, swf_version: u8, strict: bool) -> Option<f64> {
+    fn is_ascii_digit(c: u16) -> bool {
+        u8::try_from(c).map_or(false, |c| c.is_ascii_digit())
+    }
+
+    fn to_decimal_digit(c: u16) -> Option<u32> {
+        u8::try_from(c)
+            .ok()
+            .and_then(|c| char::from(c).to_digit(10))
+    }
+
+    // Allow leading whitespace.
+    skip_spaces(&mut s);
+
+    // Handle blank strings as described above.
+    if s.is_empty() {
+        return if strict { Some(0.0) } else { None };
+    }
+
+    // Parse sign.
+    let is_negative = parse_sign(&mut s);
+    let after_sign = s;
+
+    // Count digits before decimal point.
+    s = s.trim_start_matches(is_ascii_digit);
+    let mut total_digits = after_sign.len() - s.len();
+
+    // Count digits after decimal point.
+    if let Some(after_dot) = s.strip_prefix(b'.') {
+        s = after_dot;
+        s = s.trim_start_matches(is_ascii_digit);
+        total_digits += after_dot.len() - s.len();
+    }
+
+    // Handle exponent.
+    let mut exponent: i32 = 0;
+    if let Some(after_e) = s.strip_prefix(b"eE".as_ref()) {
+        s = after_e;
+
+        // Parse exponent sign.
+        let exponent_is_negative = parse_sign(&mut s);
+
+        // Fail if string ends with "e-" with no exponent value specified.
+        if exponent_is_negative && s.is_empty() {
+            return None;
+        }
+
+        // Parse exponent itself.
+        s = s.trim_start_matches(|c| match to_decimal_digit(c) {
+            Some(digit) => {
+                exponent = exponent.wrapping_mul(10);
+                exponent = exponent.wrapping_add(digit as i32);
+                true
+            }
+            None => false,
+        });
+
+        // Apply exponent sign.
+        if exponent_is_negative {
+            exponent = exponent.wrapping_neg();
+        }
+    }
+
+    // Allow trailing whitespace.
+    skip_spaces(&mut s);
+
+    // If we got no digits, check for Infinity/-Infinity. Otherwise fail.
+    if total_digits == 0 {
+        if let Some(after_infinity) = s.strip_prefix(WStr::from_units(b"Infinity")) {
+            s = after_infinity;
+
+            // Allow end of string or a whitespace. Otherwise fail.
+            if !s.is_empty() {
+                skip_spaces(&mut s);
+                // TODO: Compare by reference instead?
+                if s.len() == after_infinity.len() {
+                    return None;
+                }
+            }
+
+            let result = if is_negative {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            };
+            return Some(result);
+        }
+        return None;
+    }
+
+    // Fail if we got digits, but we're in strict mode and not at end of string or at a null character.
+    if strict && !s.is_empty() && !s.starts_with(b'\0') {
+        return None;
+    }
+
+    // Bug compatibility: https://bugzilla.mozilla.org/show_bug.cgi?id=513018
+    let s = if swf_version >= 11 {
+        &after_sign[..after_sign.len() - s.len()]
+    } else {
+        after_sign
+    };
+
+    // Finally, calculate the result.
+    let mut result = if total_digits > 15 {
+        // With more than 15 digits, avmplus uses integer arithmetic to avoid rounding errors.
+        let mut result: i64 = 0;
+        let mut decimal_digits = -1;
+        for c in s {
+            if let Some(digit) = to_decimal_digit(c) {
+                if decimal_digits != -1 {
+                    decimal_digits += 1;
+                }
+
+                result *= 10;
+                result += i64::from(digit);
+            } else if c == b'.' as u16 {
+                decimal_digits = 0;
+            } else {
+                break;
+            }
+        }
+
+        if decimal_digits > 0 {
+            exponent -= decimal_digits;
+        }
+
+        if exponent > 0 {
+            result *= i64::pow(10, exponent as u32);
+        }
+
+        result as f64
+    } else {
+        let mut result = 0.0;
+        let mut decimal_digits = -1;
+        for c in s {
+            if let Some(digit) = to_decimal_digit(c) {
+                if decimal_digits != -1 {
+                    decimal_digits += 1;
+                }
+
+                result *= 10.0;
+                result += digit as f64;
+            } else if c == b'.' as u16 {
+                decimal_digits = 0;
+            } else {
+                break;
+            }
+        }
+
+        if decimal_digits > 0 {
+            exponent -= decimal_digits;
+        }
+
+        if exponent > 0 {
+            result *= f64::powi(10.0, exponent);
+        }
+
+        result
+    };
+
+    if exponent < 0 {
+        if exponent < -307 {
+            let diff = exponent + 307;
+            result /= f64::powi(10.0, -diff);
+            exponent = -307;
+        }
+        result /= f64::powi(10.0, -exponent);
+    }
+
+    // Apply sign.
+    if is_negative {
+        result = -result;
+    }
+
+    // We shouldn't return `NaN` after a successful parsing.
+    debug_assert!(!result.is_nan());
+    Some(result)
+}
+
+#[allow(clippy::needless_lifetimes)]
+pub fn abc_int<'gc>(
+    translation_unit: TranslationUnit<'gc>,
+    index: Index<i32>,
+) -> Result<i32, Error<'gc>> {
     if index.0 == 0 {
         return Ok(0);
     }
@@ -152,7 +470,11 @@ pub fn abc_int(translation_unit: TranslationUnit<'_>, index: Index<i32>) -> Resu
         .ok_or_else(|| format!("Unknown int constant {}", index.0).into())
 }
 
-pub fn abc_uint(translation_unit: TranslationUnit<'_>, index: Index<u32>) -> Result<u32, Error> {
+#[allow(clippy::needless_lifetimes)]
+pub fn abc_uint<'gc>(
+    translation_unit: TranslationUnit<'gc>,
+    index: Index<u32>,
+) -> Result<u32, Error<'gc>> {
     if index.0 == 0 {
         return Ok(0);
     }
@@ -166,7 +488,11 @@ pub fn abc_uint(translation_unit: TranslationUnit<'_>, index: Index<u32>) -> Res
         .ok_or_else(|| format!("Unknown uint constant {}", index.0).into())
 }
 
-pub fn abc_double(translation_unit: TranslationUnit<'_>, index: Index<f64>) -> Result<f64, Error> {
+#[allow(clippy::needless_lifetimes)]
+pub fn abc_double<'gc>(
+    translation_unit: TranslationUnit<'gc>,
+    index: Index<f64>,
+) -> Result<f64, Error<'gc>> {
     if index.0 == 0 {
         return Ok(f64::NAN);
     }
@@ -185,7 +511,7 @@ pub fn abc_default_value<'gc>(
     translation_unit: TranslationUnit<'gc>,
     default: &AbcDefaultValue,
     activation: &mut Activation<'_, 'gc, '_>,
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     match default {
         AbcDefaultValue::Int(i) => abc_int(translation_unit, *i).map(|v| v.into()),
         AbcDefaultValue::Uint(u) => abc_uint(translation_unit, *u).map(|v| v.into()),
@@ -212,7 +538,7 @@ pub fn abc_default_value<'gc>(
 }
 
 impl<'gc> Value<'gc> {
-    pub fn as_namespace(&self) -> Result<Ref<Namespace<'gc>>, Error> {
+    pub fn as_namespace(&self) -> Result<Ref<Namespace<'gc>>, Error<'gc>> {
         match self {
             Value::Object(ns) => ns
                 .as_namespace()
@@ -227,7 +553,7 @@ impl<'gc> Value<'gc> {
     /// object methods called. This should only be used if you specifically
     /// need the behavior of only handling actual numbers; otherwise you should
     /// use the appropriate `coerce_to_` method.
-    pub fn as_number(&self, mc: MutationContext<'gc, '_>) -> Result<f64, Error> {
+    pub fn as_number(&self, mc: MutationContext<'gc, '_>) -> Result<f64, Error<'gc>> {
         match self {
             // Methods that look for numbers in Flash Player don't seem to care
             // about user-defined `valueOf` implementations. This code upholds
@@ -236,12 +562,10 @@ impl<'gc> Value<'gc> {
             Value::Object(num) => match num.value_of(mc)? {
                 Value::Number(num) => Ok(num),
                 Value::Integer(num) => Ok(num as f64),
-                Value::Unsigned(num) => Ok(num as f64),
                 _ => Err(format!("Expected Number, int, or uint, found {:?}", self).into()),
             },
             Value::Number(num) => Ok(*num),
             Value::Integer(num) => Ok(*num as f64),
-            Value::Unsigned(num) => Ok(*num as f64),
             _ => Err(format!("Expected Number, int, or uint, found {:?}", self).into()),
         }
     }
@@ -264,7 +588,6 @@ impl<'gc> Value<'gc> {
             Value::Undefined | Value::Null => false,
             Value::Bool(b) => *b,
             Value::Number(f) => !f.is_nan() && *f != 0.0,
-            Value::Unsigned(u) => *u != 0,
             Value::Integer(i) => *i != 0,
             Value::String(s) => !s.is_empty(),
             Value::Object(_) => true,
@@ -287,7 +610,7 @@ impl<'gc> Value<'gc> {
         &self,
         hint: Option<Hint>,
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<Value<'gc>, Error> {
+    ) -> Result<Value<'gc>, Error<'gc>> {
         let hint = hint.unwrap_or_else(|| match self {
             Value::Object(o) => o.default_hint(),
             _ => Hint::Number,
@@ -299,13 +622,9 @@ impl<'gc> Value<'gc> {
                 let object = *o;
 
                 if let Value::Object(_) =
-                    object.get_property(&QName::dynamic_name("toString").into(), activation)?
+                    object.get_property(&Multiname::public("toString"), activation)?
                 {
-                    prim = object.call_property(
-                        &QName::dynamic_name("toString").into(),
-                        &[],
-                        activation,
-                    )?;
+                    prim = object.call_property(&Multiname::public("toString"), &[], activation)?;
                 }
 
                 if prim.is_primitive() {
@@ -313,13 +632,9 @@ impl<'gc> Value<'gc> {
                 }
 
                 if let Value::Object(_) =
-                    object.get_property(&QName::dynamic_name("valueOf").into(), activation)?
+                    object.get_property(&Multiname::public("valueOf"), activation)?
                 {
-                    prim = object.call_property(
-                        &QName::dynamic_name("valueOf").into(),
-                        &[],
-                        activation,
-                    )?;
+                    prim = object.call_property(&Multiname::public("valueOf"), &[], activation)?;
                 }
 
                 if prim.is_primitive() {
@@ -333,13 +648,9 @@ impl<'gc> Value<'gc> {
                 let object = *o;
 
                 if let Value::Object(_) =
-                    object.get_property(&QName::dynamic_name("valueOf").into(), activation)?
+                    object.get_property(&Multiname::public("valueOf"), activation)?
                 {
-                    prim = object.call_property(
-                        &QName::dynamic_name("valueOf").into(),
-                        &[],
-                        activation,
-                    )?;
+                    prim = object.call_property(&Multiname::public("valueOf"), &[], activation)?;
                 }
 
                 if prim.is_primitive() {
@@ -347,13 +658,9 @@ impl<'gc> Value<'gc> {
                 }
 
                 if let Value::Object(_) =
-                    object.get_property(&QName::dynamic_name("toString").into(), activation)?
+                    object.get_property(&Multiname::public("toString"), activation)?
                 {
-                    prim = object.call_property(
-                        &QName::dynamic_name("toString").into(),
-                        &[],
-                        activation,
-                    )?;
+                    prim = object.call_property(&Multiname::public("toString"), &[], activation)?;
                 }
 
                 if prim.is_primitive() {
@@ -374,54 +681,20 @@ impl<'gc> Value<'gc> {
     ///
     /// Numerical conversions occur according to ECMA-262 3rd Edition's
     /// ToNumber algorithm which appears to match AVM2.
-    pub fn coerce_to_number(&self, activation: &mut Activation<'_, 'gc, '_>) -> Result<f64, Error> {
+    pub fn coerce_to_number(
+        &self,
+        activation: &mut Activation<'_, 'gc, '_>,
+    ) -> Result<f64, Error<'gc>> {
         Ok(match self {
             Value::Undefined => f64::NAN,
             Value::Null => 0.0,
             Value::Bool(true) => 1.0,
             Value::Bool(false) => 0.0,
             Value::Number(n) => *n,
-            Value::Unsigned(u) => *u as f64,
             Value::Integer(i) => *i as f64,
             Value::String(s) => {
-                let strim = s.trim();
-                if strim.is_empty() {
-                    0.0
-                } else if strim.starts_with(WStr::from_units(b"0x"))
-                    || strim.starts_with(WStr::from_units(b"0X"))
-                {
-                    let mut n: f64 = 0.0;
-                    for c in &strim[2..] {
-                        let digit = u8::try_from(c).ok().and_then(|c| (c as char).to_digit(16));
-                        if let Some(digit) = digit {
-                            n = 16.0 * n + f64::from(digit);
-                        } else {
-                            return Ok(f64::NAN);
-                        }
-                    }
-
-                    n
-                } else {
-                    let (sign, digits) = if let Some(stripped) = strim.strip_prefix(b'+') {
-                        (1.0, stripped)
-                    } else if let Some(stripped) = strim.strip_prefix(b'-') {
-                        (-1.0, stripped)
-                    } else {
-                        (1.0, strim)
-                    };
-
-                    if digits == b"Infinity" {
-                        return Ok(sign * f64::INFINITY);
-                    } else if digits.starts_with([b'i', b'I'].as_ref()) {
-                        // Avoid Rust f64::parse accepting "inf" and "infinity"
-                        return Ok(f64::NAN);
-                    }
-
-                    //TODO: This is slightly more permissive than ES3 spec, as
-                    //Rust documentation claims it will accept "inf" as f64
-                    //infinity.
-                    sign * digits.parse().unwrap_or(f64::NAN)
-                }
+                let swf_version = activation.context.swf.version();
+                string_to_f64(s, swf_version, true).unwrap_or_else(|| string_to_int(s, 0, true))
             }
             Value::Object(_) => self
                 .coerce_to_primitive(Some(Hint::Number), activation)?
@@ -436,7 +709,10 @@ impl<'gc> Value<'gc> {
     ///
     /// Numerical conversions occur according to ECMA-262 3rd Edition's
     /// ToUint32 algorithm which appears to match AVM2.
-    pub fn coerce_to_u32(&self, activation: &mut Activation<'_, 'gc, '_>) -> Result<u32, Error> {
+    pub fn coerce_to_u32(
+        &self,
+        activation: &mut Activation<'_, 'gc, '_>,
+    ) -> Result<u32, Error<'gc>> {
         Ok(f64_to_wrapping_u32(self.coerce_to_number(activation)?))
     }
 
@@ -447,7 +723,10 @@ impl<'gc> Value<'gc> {
     ///
     /// Numerical conversions occur according to ECMA-262 3rd Edition's
     /// ToInt32 algorithm which appears to match AVM2.
-    pub fn coerce_to_i32(&self, activation: &mut Activation<'_, 'gc, '_>) -> Result<i32, Error> {
+    pub fn coerce_to_i32(
+        &self,
+        activation: &mut Activation<'_, 'gc, '_>,
+    ) -> Result<i32, Error<'gc>> {
         Ok(f64_to_wrapping_i32(self.coerce_to_number(activation)?))
     }
 
@@ -483,7 +762,7 @@ impl<'gc> Value<'gc> {
     pub fn coerce_to_string<'a>(
         &'a self,
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<AvmString<'gc>, Error> {
+    ) -> Result<AvmString<'gc>, Error<'gc>> {
         Ok(match self {
             Value::Undefined => "undefined".into(),
             Value::Null => "null".into(),
@@ -518,7 +797,6 @@ impl<'gc> Value<'gc> {
                     AvmString::new_utf8(activation.context.gc_context, n.to_string())
                 }
             }
-            Value::Unsigned(u) => AvmString::new_utf8(activation.context.gc_context, u.to_string()),
             Value::Integer(i) => AvmString::new_utf8(activation.context.gc_context, i.to_string()),
             Value::String(s) => *s,
             Value::Object(_) => self
@@ -536,7 +814,7 @@ impl<'gc> Value<'gc> {
     pub fn coerce_to_debug_string<'a>(
         &'a self,
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<AvmString<'gc>, Error> {
+    ) -> Result<AvmString<'gc>, Error<'gc>> {
         Ok(match self {
             Value::String(s) => {
                 AvmString::new_utf8(activation.context.gc_context, format!("\"{}\"", s))
@@ -559,7 +837,7 @@ impl<'gc> Value<'gc> {
     pub fn coerce_to_object(
         &self,
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<Object<'gc>, Error> {
+    ) -> Result<Object<'gc>, Error<'gc>> {
         match self {
             Value::Undefined => return Err("TypeError: undefined is not an Object".into()),
             Value::Null => return Err("TypeError: null is not an Object".into()),
@@ -568,6 +846,83 @@ impl<'gc> Value<'gc> {
         };
 
         PrimitiveObject::from_primitive(*self, activation)
+    }
+
+    /// Coerce the value to an object, and report an error relating to object
+    /// receivers being null or undefined otherwise.
+    ///
+    /// If the `name` parameter is provided, the error will indicate the object
+    /// property being interacted with.
+    pub fn coerce_to_receiver(
+        &self,
+        activation: &mut Activation<'_, 'gc, '_>,
+        name: Option<&Multiname<'gc>>,
+    ) -> Result<Object<'gc>, Error<'gc>> {
+        self.coerce_to_object(activation).map_err(|_| {
+            if let Some(name) = name {
+                format!(
+                    "Cannot access property {} of null or undefined",
+                    name.to_qualified_name(activation.context.gc_context)
+                )
+                .into()
+            } else {
+                "Cannot access properties of null or undefined".into()
+            }
+        })
+    }
+
+    pub fn as_object(&self) -> Option<Object<'gc>> {
+        match self {
+            Value::Object(o) => Some(*o),
+            _ => None,
+        }
+    }
+
+    /// Unwrap the value's object, if present, and otherwise report an error
+    /// if the value is not a callable object (class or function).
+    ///
+    /// This is also suitable for constructors (with the exception of
+    /// `DispatchObject`, which user code shouldn't be able to access).
+    ///
+    /// The `name` parameter allows inclusion of the name used to look up the
+    /// callable in the resulting error, if provided.
+    ///
+    /// The `receiver` parameter allows inclusion of the type of the receiver
+    /// in the error message, if provided.
+    pub fn as_callable(
+        &self,
+        activation: &mut Activation<'_, 'gc, '_>,
+        name: Option<&Multiname<'gc>>,
+        receiver: Option<Object<'gc>>,
+    ) -> Result<Object<'gc>, Error<'gc>> {
+        self.as_object()
+            .filter(|o| o.as_class_object().is_some() || o.as_executable().is_some())
+            .ok_or_else(|| {
+                if let Some(receiver) = receiver {
+                    if let Some(name) = name {
+                        format!(
+                            "Cannot call null or undefined method {} of class {}",
+                            name.to_qualified_name(activation.context.gc_context),
+                            receiver.instance_of_class_name(activation.context.gc_context)
+                        )
+                        .into()
+                    } else {
+                        format!(
+                            "Cannot call null or undefined method of class {}",
+                            receiver.instance_of_class_name(activation.context.gc_context)
+                        )
+                        .into()
+                    }
+                } else if let Some(name) = name {
+                    format!(
+                        "Cannot call null or undefined function {}",
+                        name.to_qualified_name(activation.context.gc_context)
+                    )
+                    .into()
+                } else {
+                    "Cannot call null or undefined function".into()
+                }
+            })
     }
 
     /// Coerce the value to another value by type name.
@@ -582,7 +937,7 @@ impl<'gc> Value<'gc> {
         &self,
         activation: &mut Activation<'_, 'gc, '_>,
         class: ClassObject<'gc>,
-    ) -> Result<Value<'gc>, Error> {
+    ) -> Result<Value<'gc>, Error<'gc>> {
         if Object::ptr_eq(class, activation.avm2().classes().int) {
             return Ok(self.coerce_to_i32(activation)?.into());
         }
@@ -608,18 +963,30 @@ impl<'gc> Value<'gc> {
         }
 
         if let Ok(object) = self.coerce_to_object(activation) {
-            if object.is_of_type(class, activation)? {
+            if object.is_of_type(class, activation) {
                 return Ok(object.into());
+            }
+
+            if let Some(vector) = object.as_vector_storage() {
+                let name = class.inner_class_definition().read().name();
+                if name == QName::new(Namespace::package(NS_VECTOR), "Vector")
+                    || (name == QName::new(Namespace::internal(NS_VECTOR), "Vector$int")
+                        && vector.value_type() == activation.avm2().classes().int)
+                    || (name == QName::new(Namespace::internal(NS_VECTOR), "Vector$uint")
+                        && vector.value_type() == activation.avm2().classes().uint)
+                    || (name == QName::new(Namespace::internal(NS_VECTOR), "Vector$number")
+                        && vector.value_type() == activation.avm2().classes().number)
+                    || (name == QName::new(Namespace::internal(NS_VECTOR), "Vector$object")
+                        && vector.value_type() == activation.avm2().classes().object)
+                {
+                    return Ok(*self);
+                }
             }
         }
 
-        let static_class = class.inner_class_definition();
-        Err(format!(
-            "Cannot coerce {:?} to an {:?}",
-            self,
-            static_class.read().name()
-        )
-        .into())
+        let name = class.inner_class_definition().read().name();
+
+        Err(format!("Cannot coerce {:?} to an {:?}", self, name).into())
     }
 
     /// Determine if this value is any kind of number.
@@ -627,7 +994,6 @@ impl<'gc> Value<'gc> {
         match self {
             Value::Number(_) => true,
             Value::Integer(_) => true,
-            Value::Unsigned(_) => true,
             Value::Object(o) => o.as_primitive().map(|p| p.is_number()).unwrap_or(false),
             _ => false,
         }
@@ -640,7 +1006,6 @@ impl<'gc> Value<'gc> {
         match self {
             Value::Number(n) => *n == (*n as u32 as f64),
             Value::Integer(i) => *i >= 0,
-            Value::Unsigned(_) => true,
             Value::Object(o) => o.as_primitive().map(|p| p.is_u32()).unwrap_or(false),
             _ => false,
         }
@@ -653,7 +1018,6 @@ impl<'gc> Value<'gc> {
         match self {
             Value::Number(n) => *n == (*n as i32 as f64),
             Value::Integer(_) => true,
-            Value::Unsigned(u) => *u <= i32::MAX as u32,
             Value::Object(o) => o.as_primitive().map(|p| p.is_i32()).unwrap_or(false),
             _ => false,
         }
@@ -669,21 +1033,21 @@ impl<'gc> Value<'gc> {
         &self,
         activation: &mut Activation<'_, 'gc, '_>,
         type_object: ClassObject<'gc>,
-    ) -> Result<bool, Error> {
+    ) -> bool {
         if Object::ptr_eq(type_object, activation.avm2().classes().number) {
-            return Ok(self.is_number());
+            return self.is_number();
         }
         if Object::ptr_eq(type_object, activation.avm2().classes().uint) {
-            return Ok(self.is_u32());
+            return self.is_u32();
         }
         if Object::ptr_eq(type_object, activation.avm2().classes().int) {
-            return Ok(self.is_i32());
+            return self.is_i32();
         }
 
         if let Ok(o) = self.coerce_to_object(activation) {
             o.is_of_type(type_object, activation)
         } else {
-            Ok(false)
+            false
         }
     }
 
@@ -696,18 +1060,12 @@ impl<'gc> Value<'gc> {
         &self,
         other: &Value<'gc>,
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<bool, Error> {
+    ) -> Result<bool, Error<'gc>> {
         match (self, other) {
             (Value::Undefined, Value::Undefined) => Ok(true),
             (Value::Null, Value::Null) => Ok(true),
-            (Value::Unsigned(a), Value::Unsigned(b)) => Ok(a == b),
-            (Value::Unsigned(a), Value::Integer(b)) => Ok(*a as i64 == *b as i64),
-            (Value::Integer(a), Value::Unsigned(b)) => Ok(*a as i64 == *b as i64),
             (Value::Integer(a), Value::Integer(b)) => Ok(a == b),
-            (
-                Value::Number(_) | Value::Unsigned(_) | Value::Integer(_),
-                Value::Number(_) | Value::Unsigned(_) | Value::Integer(_),
-            ) => {
+            (Value::Number(_) | Value::Integer(_), Value::Number(_) | Value::Integer(_)) => {
                 let a = self.coerce_to_number(activation)?;
                 let b = other.coerce_to_number(activation)?;
 
@@ -730,12 +1088,12 @@ impl<'gc> Value<'gc> {
             (Value::Object(a), Value::Object(b)) => Ok(Object::ptr_eq(*a, *b)),
             (Value::Undefined, Value::Null) => Ok(true),
             (Value::Null, Value::Undefined) => Ok(true),
-            (Value::Number(_) | Value::Unsigned(_) | Value::Integer(_), Value::String(_)) => {
+            (Value::Number(_) | Value::Integer(_), Value::String(_)) => {
                 let number_other = Value::from(other.coerce_to_number(activation)?);
 
                 self.abstract_eq(&number_other, activation)
             }
-            (Value::String(_), Value::Number(_) | Value::Unsigned(_) | Value::Integer(_)) => {
+            (Value::String(_), Value::Number(_) | Value::Integer(_)) => {
                 let number_self = Value::from(self.coerce_to_number(activation)?);
 
                 number_self.abstract_eq(other, activation)
@@ -750,19 +1108,13 @@ impl<'gc> Value<'gc> {
 
                 self.abstract_eq(&number_other, activation)
             }
-            (
-                Value::String(_) | Value::Number(_) | Value::Unsigned(_) | Value::Integer(_),
-                Value::Object(_),
-            ) => {
+            (Value::String(_) | Value::Number(_) | Value::Integer(_), Value::Object(_)) => {
                 //TODO: Should this be `Hint::Number`, `Hint::String`, or no-hint?
                 let primitive_other = other.coerce_to_primitive(Some(Hint::Number), activation)?;
 
                 self.abstract_eq(&primitive_other, activation)
             }
-            (
-                Value::Object(_),
-                Value::String(_) | Value::Number(_) | Value::Unsigned(_) | Value::Integer(_),
-            ) => {
+            (Value::Object(_), Value::String(_) | Value::Number(_) | Value::Integer(_)) => {
                 //TODO: Should this be `Hint::Number`, `Hint::String`, or no-hint?
                 let primitive_self = self.coerce_to_primitive(Some(Hint::Number), activation)?;
 
@@ -782,7 +1134,7 @@ impl<'gc> Value<'gc> {
         &self,
         other: &Value<'gc>,
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<Option<bool>, Error> {
+    ) -> Result<Option<bool>, Error<'gc>> {
         let prim_self = self.coerce_to_primitive(Some(Hint::Number), activation)?;
         let prim_other = other.coerce_to_primitive(Some(Hint::Number), activation)?;
 

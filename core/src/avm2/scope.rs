@@ -2,10 +2,10 @@
 
 use crate::avm2::activation::Activation;
 use crate::avm2::domain::Domain;
-use crate::avm2::names::Multiname;
 use crate::avm2::object::{Object, TObject};
 use crate::avm2::value::Value;
 use crate::avm2::Error;
+use crate::avm2::Multiname;
 use gc_arena::{Collect, Gc, MutationContext};
 use std::ops::Deref;
 
@@ -122,7 +122,7 @@ impl<'gc> ScopeChain<'gc> {
         &self,
         multiname: &Multiname<'gc>,
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<Option<Object<'gc>>, Error> {
+    ) -> Result<Option<Object<'gc>>, Error<'gc>> {
         // First search our scopes
         if let Some(scopes) = self.scopes {
             for (depth, scope) in scopes.iter().enumerate().rev() {
@@ -153,7 +153,7 @@ impl<'gc> ScopeChain<'gc> {
         &self,
         name: &Multiname<'gc>,
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<Option<Value<'gc>>, Error> {
+    ) -> Result<Option<Value<'gc>>, Error<'gc>> {
         if let Some(object) = self.find(name, activation)? {
             Ok(Some(object.get_property(name, activation)?))
         } else {
@@ -174,6 +174,10 @@ pub struct ScopeStack<'gc> {
 impl<'gc> ScopeStack<'gc> {
     pub fn new() -> Self {
         Self { scopes: Vec::new() }
+    }
+
+    pub fn clear(&mut self) {
+        self.scopes.clear();
     }
 
     pub fn push(&mut self, scope: Scope<'gc>) {
@@ -202,7 +206,7 @@ impl<'gc> ScopeStack<'gc> {
         &self,
         multiname: &Multiname<'gc>,
         global: bool,
-    ) -> Result<Option<Object<'gc>>, Error> {
+    ) -> Result<Option<Object<'gc>>, Error<'gc>> {
         for (depth, scope) in self.scopes.iter().enumerate().rev() {
             let values = scope.values();
 

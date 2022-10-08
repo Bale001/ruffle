@@ -1,7 +1,8 @@
 use crate::events::{KeyCode, PlayerEvent};
+use std::borrow::Cow;
 use std::collections::HashSet;
 
-pub type Error = Box<dyn std::error::Error>;
+pub type FullscreenError = Cow<'static, str>;
 
 pub trait UiBackend {
     fn mouse_visible(&self) -> bool;
@@ -14,7 +15,7 @@ pub trait UiBackend {
     /// Sets the clipboard to the given content.
     fn set_clipboard_content(&mut self, content: String);
 
-    fn set_fullscreen(&mut self, is_full: bool) -> Result<(), Error>;
+    fn set_fullscreen(&mut self, is_full: bool) -> Result<(), FullscreenError>;
 
     /// Displays a warning about unsupported content in Ruffle.
     /// The user can still click an "OK" or "run anyway" message to dismiss the warning.
@@ -65,22 +66,32 @@ impl InputManager {
         }
     }
 
+    fn add_key(&mut self, key_code: KeyCode) {
+        self.last_key = key_code;
+        if key_code != KeyCode::Unknown {
+            self.keys_down.insert(key_code);
+        }
+    }
+
+    fn remove_key(&mut self, key_code: KeyCode) {
+        self.last_key = key_code;
+        if key_code != KeyCode::Unknown {
+            self.keys_down.remove(&key_code);
+        }
+    }
+
     pub fn handle_event(&mut self, event: &PlayerEvent) {
         match *event {
             PlayerEvent::KeyDown { key_code, key_char } => {
-                self.last_key = key_code;
                 self.last_char = key_char;
-                if key_code != KeyCode::Unknown {
-                    self.keys_down.insert(key_code);
-                }
+                self.add_key(key_code);
             }
             PlayerEvent::KeyUp { key_code, key_char } => {
-                self.last_key = key_code;
                 self.last_char = key_char;
-                if key_code != KeyCode::Unknown {
-                    self.keys_down.remove(&key_code);
-                }
+                self.remove_key(key_code);
             }
+            PlayerEvent::MouseDown { button, .. } => self.add_key(button.into()),
+            PlayerEvent::MouseUp { button, .. } => self.remove_key(button.into()),
             _ => {}
         }
     }
@@ -95,6 +106,10 @@ impl InputManager {
 
     pub fn last_key_char(&self) -> Option<char> {
         self.last_char
+    }
+
+    pub fn is_mouse_down(&self) -> bool {
+        self.is_key_down(KeyCode::MouseLeft)
     }
 }
 
@@ -124,7 +139,7 @@ impl UiBackend for NullUiBackend {
 
     fn set_clipboard_content(&mut self, _content: String) {}
 
-    fn set_fullscreen(&mut self, _is_full: bool) -> Result<(), Error> {
+    fn set_fullscreen(&mut self, _is_full: bool) -> Result<(), FullscreenError> {
         Ok(())
     }
 

@@ -1,10 +1,12 @@
-use crate::backend::render::ShapeHandle;
 use crate::context::{RenderContext, UpdateContext};
 use crate::display_object::{DisplayObjectBase, DisplayObjectPtr, TDisplayObject};
+use crate::library::Library;
 use crate::prelude::*;
 use crate::tag_utils::SwfMovie;
 use gc_arena::{Collect, Gc, GcCell, MutationContext};
-use std::cell::{Ref, RefMut};
+use ruffle_render::backend::{RenderBackend, ShapeHandle};
+use ruffle_render::commands::CommandHandler;
+use std::cell::{Ref, RefCell, RefMut};
 use std::sync::Arc;
 use swf::{Fixed16, Fixed8, Twips};
 
@@ -21,10 +23,12 @@ pub struct MorphShapeData<'gc> {
 }
 
 impl<'gc> MorphShape<'gc> {
-    pub fn new(
-        gc_context: gc_arena::MutationContext<'gc, '_>,
-        static_data: MorphShapeStatic,
+    pub fn from_swf_tag(
+        gc_context: MutationContext<'gc, '_>,
+        tag: swf::DefineMorphShape,
+        movie: Arc<SwfMovie>,
     ) -> Self {
+        let static_data = MorphShapeStatic::from_swf_tag(&tag, movie);
         MorphShape(GcCell::allocate(
             gc_context,
             MorphShapeData {
@@ -86,22 +90,21 @@ impl<'gc> TDisplayObject<'gc> for MorphShape<'gc> {
     }
 
     fn render_self(&self, context: &mut RenderContext) {
-        if let Some(frame) = self.0.read().static_data.frames.get(&self.ratio()) {
-            context
-                .renderer
-                .render_shape(frame.shape_handle, context.transform_stack.transform());
-        } else {
-            log::warn!("Missing ratio for morph shape");
-        }
+        let this = self.0.read();
+        let ratio = this.ratio;
+        let static_data = this.static_data;
+        let shape_handle = static_data.get_shape(context.renderer, context.library, ratio);
+        context
+            .commands
+            .render_shape(shape_handle, context.transform_stack.transform());
     }
 
     fn self_bounds(&self) -> BoundingBox {
-        // TODO: Use the bounds of the current ratio.
-        if let Some(frame) = self.0.read().static_data.frames.get(&self.ratio()) {
-            frame.bounds.clone()
-        } else {
-            BoundingBox::default()
-        }
+        let this = self.0.read();
+        let ratio = this.ratio;
+        let static_data = this.static_data;
+        let frame = static_data.get_frame(ratio);
+        frame.bounds.clone()
     }
 
     fn hit_test_shape(
@@ -111,10 +114,14 @@ impl<'gc> TDisplayObject<'gc> for MorphShape<'gc> {
         _options: HitTestOptions,
     ) -> bool {
         if self.world_bounds().contains(point) {
-            if let Some(frame) = self.0.read().static_data.frames.get(&self.ratio()) {
+            if let Some(frame) = self.0.read().static_data.frames.borrow().get(&self.ratio()) {
                 let local_matrix = self.global_to_local_matrix();
                 let point = local_matrix * point;
-                return crate::shape_utils::shape_hit_test(&frame.shape, point, &local_matrix);
+                return ruffle_render::shape_utils::shape_hit_test(
+                    &frame.shape,
+                    point,
+                    &local_matrix,
+                );
             } else {
                 log::warn!("Missing ratio for morph shape");
             }
@@ -126,7 +133,7 @@ impl<'gc> TDisplayObject<'gc> for MorphShape<'gc> {
 
 /// A precalculated intermediate frame for a morph shape.
 struct Frame {
-    shape_handle: ShapeHandle,
+    shape_handle: Option<ShapeHandle>,
     shape: swf::Shape,
     bounds: BoundingBox,
 }
@@ -139,40 +146,52 @@ pub struct MorphShapeStatic {
     id: CharacterId,
     start: swf::MorphShape,
     end: swf::MorphShape,
-    frames: fnv::FnvHashMap<u16, Frame>,
+    frames: RefCell<fnv::FnvHashMap<u16, Frame>>,
     movie: Arc<SwfMovie>,
 }
 
 impl MorphShapeStatic {
-    pub fn from_swf_tag(
-        context: &mut UpdateContext<'_, '_, '_>,
-        swf_tag: &swf::DefineMorphShape,
-        movie: Arc<SwfMovie>,
-    ) -> Self {
-        let mut morph_shape = Self {
+    pub fn from_swf_tag(swf_tag: &swf::DefineMorphShape, movie: Arc<SwfMovie>) -> Self {
+        Self {
             id: swf_tag.id,
             start: swf_tag.start.clone(),
             end: swf_tag.end.clone(),
-            frames: fnv::FnvHashMap::default(),
+            frames: RefCell::new(fnv::FnvHashMap::default()),
             movie,
-        };
-        // Pre-register the start and end states.
-        morph_shape.register_ratio(context, 0);
-        morph_shape.register_ratio(context, 65535);
-        morph_shape
+        }
     }
 
-    pub fn register_ratio(&mut self, context: &mut UpdateContext<'_, '_, '_>, ratio: u16) {
-        if self.frames.contains_key(&ratio) {
-            // Already registered.
-            return;
+    /// Retrieves the `Frame` for the given ratio.
+    /// Lazily intializes the frame if it does not yet exist.
+    fn get_frame(&self, ratio: u16) -> RefMut<'_, Frame> {
+        let frames = self.frames.borrow_mut();
+        RefMut::map(frames, |frames| {
+            frames
+                .entry(ratio)
+                .or_insert_with(|| self.build_morph_frame(ratio))
+        })
+    }
+
+    /// Retrieves the `ShapeHandle` for the given ratio.
+    /// Lazily intializes and tessellates the shape if it does not yet exist.
+    fn get_shape(
+        &self,
+        renderer: &'_ mut dyn RenderBackend,
+        library: &Library<'_>,
+        ratio: u16,
+    ) -> ShapeHandle {
+        let mut frame = self.get_frame(ratio);
+        if let Some(handle) = frame.shape_handle {
+            handle
+        } else {
+            let library = library.library_for_movie(self.movie.clone()).unwrap();
+            let handle = renderer.register_shape((&frame.shape).into(), library);
+            frame.shape_handle = Some(handle);
+            handle
         }
+    }
 
-        let library = context
-            .library
-            .library_for_movie(Arc::clone(&self.movie))
-            .unwrap();
-
+    fn build_morph_frame(&self, ratio: u16) -> Frame {
         // Interpolate MorphShapes into a Shape.
         use swf::{FillStyle, LineStyle, ShapeRecord, ShapeStyles};
         // Start shape is ratio 65535, end shape is ratio 0.
@@ -190,17 +209,11 @@ impl MorphShapeStatic {
             .line_styles
             .iter()
             .zip(self.end.line_styles.iter())
-            .map(|(start, end)| LineStyle {
-                width: lerp_twips(start.width, end.width, a, b),
-                color: lerp_color(&start.color, &end.color, a, b),
-                start_cap: start.start_cap,
-                end_cap: start.end_cap,
-                join_style: start.join_style,
-                fill_style: None,
-                allow_scale_x: start.allow_scale_x,
-                allow_scale_y: start.allow_scale_y,
-                is_pixel_hinted: start.is_pixel_hinted,
-                allow_close: start.allow_close,
+            .map(|(start, end)| {
+                start
+                    .clone()
+                    .with_width(lerp_twips(start.width(), end.width(), a, b))
+                    .with_fill_style(lerp_fill(start.fill_style(), end.fill_style(), a, b))
             })
             .collect();
 
@@ -285,26 +298,22 @@ impl MorphShapeStatic {
             line_styles,
         };
 
-        let bounds = crate::shape_utils::calculate_shape_bounds(&shape[..]);
+        let bounds = ruffle_render::shape_utils::calculate_shape_bounds(&shape);
         let shape = swf::Shape {
             version: 4,
             id: 0,
             shape_bounds: bounds.clone(),
             edge_bounds: bounds.clone(),
-            has_fill_winding_rule: false,
-            has_non_scaling_strokes: false,
-            has_scaling_strokes: true,
+            flags: swf::ShapeFlag::HAS_SCALING_STROKES,
             styles,
             shape,
         };
 
-        let shape_handle = context.renderer.register_shape((&shape).into(), library);
-        let frame = Frame {
-            shape_handle,
+        Frame {
+            shape_handle: None,
             shape,
             bounds: bounds.into(),
-        };
-        self.frames.insert(ratio, frame);
+        }
     }
 
     fn update_pos(x: &mut Twips, y: &mut Twips, record: &swf::ShapeRecord) {

@@ -3,22 +3,30 @@
 use crate::avm2::activation::Activation;
 use crate::avm2::class::Class;
 use crate::avm2::method::{Method, NativeMethodImpl};
-use crate::avm2::names::{Namespace, QName};
-use crate::avm2::object::{stage_allocator, LoaderInfoObject, Object, TObject};
+use crate::avm2::object::{stage_allocator, Object, TObject};
 use crate::avm2::value::Value;
+use crate::avm2::ArrayObject;
 use crate::avm2::Error;
-use crate::display_object::{DisplayObject, HitTestOptions, TDisplayObject};
+use crate::avm2::Multiname;
+use crate::avm2::Namespace;
+use crate::avm2::QName;
+use crate::display_object::{HitTestOptions, TDisplayObject};
+use crate::ecma_conversions::round_to_even;
+use crate::frame_lifecycle::catchup_display_object_to_frame;
+use crate::string::AvmString;
 use crate::types::{Degrees, Percent};
 use crate::vminterface::Instantiator;
 use gc_arena::{GcCell, MutationContext};
+use std::str::FromStr;
 use swf::Twips;
+use swf::{BlendMode, Rectangle};
 
 /// Implements `flash.display.DisplayObject`'s instance constructor.
 pub fn instance_init<'gc>(
     _activation: &mut Activation<'_, 'gc, '_>,
     _this: Option<Object<'gc>>,
     _args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     Err("You cannot construct DisplayObject directly.".into())
 }
 
@@ -27,7 +35,7 @@ pub fn native_instance_init<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     _args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(this) = this {
         activation.super_init(this, &[])?;
 
@@ -51,14 +59,8 @@ pub fn native_instance_init<'gc>(
                 this.init_display_object(activation.context.gc_context, child);
                 child.set_object2(activation.context.gc_context, this);
 
-                child.post_instantiation(
-                    &mut activation.context,
-                    child,
-                    None,
-                    Instantiator::Avm2,
-                    false,
-                );
-                child.construct_frame(&mut activation.context);
+                child.post_instantiation(&mut activation.context, None, Instantiator::Avm2, false);
+                catchup_display_object_to_frame(&mut activation.context, child);
             }
         }
     }
@@ -71,7 +73,7 @@ pub fn class_init<'gc>(
     _activation: &mut Activation<'_, 'gc, '_>,
     _this: Option<Object<'gc>>,
     _args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     Ok(Value::Undefined)
 }
 
@@ -80,7 +82,7 @@ pub fn alpha<'gc>(
     _activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     _args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(dobj) = this.and_then(|this| this.as_display_object()) {
         return Ok(dobj.alpha().into());
     }
@@ -93,7 +95,7 @@ pub fn set_alpha<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(dobj) = this.and_then(|this| this.as_display_object()) {
         let new_alpha = args
             .get(0)
@@ -111,7 +113,7 @@ pub fn height<'gc>(
     _activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     _args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(dobj) = this.and_then(|this| this.as_display_object()) {
         return Ok(dobj.height().into());
     }
@@ -124,7 +126,7 @@ pub fn set_height<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(dobj) = this.and_then(|this| this.as_display_object()) {
         let new_height = args
             .get(0)
@@ -145,12 +147,9 @@ pub fn scale_y<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     _args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(dobj) = this.and_then(|this| this.as_display_object()) {
-        return Ok(dobj
-            .scale_y(activation.context.gc_context)
-            .into_unit()
-            .into());
+        return Ok(dobj.scale_y(activation.context.gc_context).unit().into());
     }
 
     Ok(Value::Undefined)
@@ -161,7 +160,7 @@ pub fn set_scale_y<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(dobj) = this.and_then(|this| this.as_display_object()) {
         let new_scale = args
             .get(0)
@@ -179,7 +178,7 @@ pub fn width<'gc>(
     _activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     _args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(dobj) = this.and_then(|this| this.as_display_object()) {
         return Ok(dobj.width().into());
     }
@@ -192,7 +191,7 @@ pub fn set_width<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(dobj) = this.and_then(|this| this.as_display_object()) {
         let new_width = args
             .get(0)
@@ -213,12 +212,9 @@ pub fn scale_x<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     _args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(dobj) = this.and_then(|this| this.as_display_object()) {
-        return Ok(dobj
-            .scale_x(activation.context.gc_context)
-            .into_unit()
-            .into());
+        return Ok(dobj.scale_x(activation.context.gc_context).unit().into());
     }
 
     Ok(Value::Undefined)
@@ -229,7 +225,7 @@ pub fn set_scale_x<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(dobj) = this.and_then(|this| this.as_display_object()) {
         let new_scale = args
             .get(0)
@@ -242,12 +238,32 @@ pub fn set_scale_x<'gc>(
     Ok(Value::Undefined)
 }
 
+/// Implements `filters`'s getter.
+pub fn filters<'gc>(
+    activation: &mut Activation<'_, 'gc, '_>,
+    _this: Option<Object<'gc>>,
+    _args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    log::warn!("DisplayObject.filters getter - not yet implemented");
+    Ok(ArrayObject::empty(activation)?.into())
+}
+
+/// Implements `filters`'s setter.
+pub fn set_filters<'gc>(
+    _activation: &mut Activation<'_, 'gc, '_>,
+    _this: Option<Object<'gc>>,
+    _args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    log::warn!("DisplayObject.filters setter - not yet implemented");
+    Ok(Value::Undefined)
+}
+
 /// Implements `x`'s getter.
 pub fn x<'gc>(
     _activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     _args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(dobj) = this.and_then(|this| this.as_display_object()) {
         return Ok(dobj.x().into());
     }
@@ -260,7 +276,7 @@ pub fn set_x<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(dobj) = this.and_then(|this| this.as_display_object()) {
         let new_x = args
             .get(0)
@@ -279,7 +295,7 @@ pub fn y<'gc>(
     _activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     _args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(dobj) = this.and_then(|this| this.as_display_object()) {
         return Ok(dobj.y().into());
     }
@@ -292,7 +308,7 @@ pub fn set_y<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(dobj) = this.and_then(|this| this.as_display_object()) {
         let new_y = args
             .get(0)
@@ -306,12 +322,102 @@ pub fn set_y<'gc>(
     Ok(Value::Undefined)
 }
 
+/// Stubs `z`'s getter.
+pub fn z<'gc>(
+    _activation: &mut Activation<'_, 'gc, '_>,
+    _this: Option<Object<'gc>>,
+    _args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    Ok(0.into())
+}
+
+/// Stubs `z`'s setter.
+pub fn set_z<'gc>(
+    _activation: &mut Activation<'_, 'gc, '_>,
+    _this: Option<Object<'gc>>,
+    _args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    Ok(Value::Undefined)
+}
+
+/// Stubs `rotationX`'s getter.
+pub fn rotation_x<'gc>(
+    _activation: &mut Activation<'_, 'gc, '_>,
+    _this: Option<Object<'gc>>,
+    _args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    Ok(0.into())
+}
+
+/// Stubs `rotationX`'s setter.
+pub fn set_rotation_x<'gc>(
+    _activation: &mut Activation<'_, 'gc, '_>,
+    _this: Option<Object<'gc>>,
+    _args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    Ok(Value::Undefined)
+}
+
+/// Stubs `rotationY`'s getter.
+pub fn rotation_y<'gc>(
+    _activation: &mut Activation<'_, 'gc, '_>,
+    _this: Option<Object<'gc>>,
+    _args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    Ok(0.into())
+}
+
+/// Stubs `rotationY`'s setter.
+pub fn set_rotation_y<'gc>(
+    _activation: &mut Activation<'_, 'gc, '_>,
+    _this: Option<Object<'gc>>,
+    _args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    Ok(Value::Undefined)
+}
+
+/// Stubs `rotationZ`'s getter.
+pub fn rotation_z<'gc>(
+    _activation: &mut Activation<'_, 'gc, '_>,
+    _this: Option<Object<'gc>>,
+    _args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    Ok(0.into())
+}
+
+/// Stubs `rotationZ`'s setter.
+pub fn set_rotation_z<'gc>(
+    _activation: &mut Activation<'_, 'gc, '_>,
+    _this: Option<Object<'gc>>,
+    _args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    Ok(Value::Undefined)
+}
+
+/// Stubs `scaleZ`'s getter.
+pub fn scale_z<'gc>(
+    _activation: &mut Activation<'_, 'gc, '_>,
+    _this: Option<Object<'gc>>,
+    _args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    Ok(1.into())
+}
+
+/// Stubs `scaleZ`'s setter.
+pub fn set_scale_z<'gc>(
+    _activation: &mut Activation<'_, 'gc, '_>,
+    _this: Option<Object<'gc>>,
+    _args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    Ok(Value::Undefined)
+}
+
 /// Implements `rotation`'s getter.
 pub fn rotation<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     _args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(dobj) = this.and_then(|this| this.as_display_object()) {
         let rot: f64 = dobj.rotation(activation.context.gc_context).into();
         let rem = rot % 360.0;
@@ -331,7 +437,7 @@ pub fn set_rotation<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(dobj) = this.and_then(|this| this.as_display_object()) {
         let new_rotation = args
             .get(0)
@@ -350,7 +456,7 @@ pub fn name<'gc>(
     _activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     _args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(dobj) = this.and_then(|this| this.as_display_object()) {
         return Ok(dobj.name().into());
     }
@@ -363,7 +469,7 @@ pub fn set_name<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(dobj) = this.and_then(|this| this.as_display_object()) {
         let new_name = args
             .get(0)
@@ -390,7 +496,7 @@ pub fn parent<'gc>(
     _activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     _args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(dobj) = this.and_then(|this| this.as_display_object()) {
         return Ok(dobj
             .avm2_parent()
@@ -406,7 +512,7 @@ pub fn root<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     _args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(dobj) = this.and_then(|this| this.as_display_object()) {
         return Ok(dobj
             .avm2_root(&mut activation.context)
@@ -422,7 +528,7 @@ pub fn stage<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     _args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(dobj) = this.and_then(|this| this.as_display_object()) {
         return Ok(dobj
             .avm2_stage(&activation.context)
@@ -438,7 +544,7 @@ pub fn visible<'gc>(
     _activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     _args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(dobj) = this.and_then(|this| this.as_display_object()) {
         return Ok(dobj.visible().into());
     }
@@ -451,7 +557,7 @@ pub fn set_visible<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(dobj) = this.and_then(|this| this.as_display_object()) {
         let new_visible = args
             .get(0)
@@ -470,7 +576,7 @@ pub fn mouse_x<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     _args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(dobj) = this.and_then(|this| this.as_display_object()) {
         let local_mouse = dobj.global_to_local(*activation.context.mouse_position);
 
@@ -485,7 +591,7 @@ pub fn mouse_y<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     _args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(dobj) = this.and_then(|this| this.as_display_object()) {
         let local_mouse = dobj.global_to_local(*activation.context.mouse_position);
 
@@ -500,7 +606,7 @@ pub fn hit_test_point<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(dobj) = this.and_then(|this| this.as_display_object()) {
         let x = Twips::from_pixels(
             args.get(0)
@@ -538,17 +644,17 @@ pub fn hit_test_point<'gc>(
 
 /// Implements `hitTestObject`.
 pub fn hit_test_object<'gc>(
-    activation: &mut Activation<'_, 'gc, '_>,
+    _activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(dobj) = this.and_then(|this| this.as_display_object()) {
         if let Some(rhs_dobj) = args
             .get(0)
             .cloned()
             .unwrap_or(Value::Undefined)
-            .coerce_to_object(activation)?
-            .as_display_object()
+            .as_object()
+            .and_then(|o| o.as_display_object())
         {
             return Ok(dobj.hit_test_object(rhs_dobj).into());
         }
@@ -562,25 +668,286 @@ pub fn loader_info<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     _args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(dobj) = this.and_then(|this| this.as_display_object()) {
-        if let Some(root) = dobj.avm2_root(&mut activation.context) {
-            if DisplayObject::ptr_eq(root, dobj) {
-                let movie = dobj.movie();
-
-                if let Some(movie) = movie {
-                    let obj = LoaderInfoObject::from_movie(activation, movie, root)?;
-
-                    return Ok(obj.into());
-                }
-            }
+        // Contrary to the DisplayObject.loaderInfo documentation,
+        // Flash Player defines 'loaderInfo' for non-root DisplayObjects.
+        // It always returns the LoaderInfo from the root object.
+        if let Some(loader_info) = dobj
+            .avm2_root(&mut activation.context)
+            .and_then(|root_dobj| root_dobj.loader_info())
+        {
+            return Ok(loader_info.into());
         }
+        return Ok(Value::Null);
+    }
+    Ok(Value::Undefined)
+}
 
-        if DisplayObject::ptr_eq(dobj, activation.context.stage.into()) {
-            return Ok(LoaderInfoObject::from_stage(activation)?.into());
+pub fn transform<'gc>(
+    activation: &mut Activation<'_, 'gc, '_>,
+    this: Option<Object<'gc>>,
+    _args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    if let Some(this) = this {
+        return Ok(activation
+            .avm2()
+            .classes()
+            .transform
+            .construct(activation, &[this.into()])?
+            .into());
+    }
+    Ok(Value::Undefined)
+}
+
+pub fn set_transform<'gc>(
+    activation: &mut Activation<'_, 'gc, '_>,
+    this: Option<Object<'gc>>,
+    args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    if let Some(this) = this {
+        let transform = args[0].coerce_to_object(activation)?;
+
+        // FIXME - consider 3D matrix and pixel bounds
+        let matrix = transform
+            .get_property(&Multiname::public("matrix"), activation)?
+            .coerce_to_object(activation)?;
+        let color_transform = transform
+            .get_property(&Multiname::public("matrix"), activation)?
+            .coerce_to_object(activation)?;
+
+        let matrix =
+            crate::avm2::globals::flash::geom::transform::object_to_matrix(matrix, activation)?;
+        let color_transform =
+            crate::avm2::globals::flash::geom::transform::object_to_color_transform(
+                color_transform,
+                activation,
+            )?;
+
+        let dobj = this.as_display_object().unwrap();
+        let mut write = dobj.base_mut(activation.context.gc_context);
+        write.set_matrix(matrix);
+        write.set_color_transform(color_transform);
+    }
+    Ok(Value::Undefined)
+}
+
+/// Implements `DisplayObject.blendMode`'s getter.
+pub fn blend_mode<'gc>(
+    activation: &mut Activation<'_, 'gc, '_>,
+    this: Option<Object<'gc>>,
+    _args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    if let Some(dobj) = this.and_then(|this| this.as_display_object()) {
+        let mode =
+            AvmString::new_utf8(activation.context.gc_context, dobj.blend_mode().to_string());
+        return Ok(mode.into());
+    }
+    Ok(Value::Undefined)
+}
+
+/// Implements `DisplayObject.blendMode`'s setter.
+pub fn set_blend_mode<'gc>(
+    activation: &mut Activation<'_, 'gc, '_>,
+    this: Option<Object<'gc>>,
+    args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    if let Some(dobj) = this.and_then(|this| this.as_display_object()) {
+        let mode = args
+            .get(0)
+            .cloned()
+            .unwrap_or(Value::Undefined)
+            .coerce_to_string(activation)?;
+
+        if let Ok(mode) = BlendMode::from_str(&mode.to_string()) {
+            dobj.set_blend_mode(activation.context.gc_context, mode);
+        } else {
+            log::error!("Unknown blend mode {}", mode);
+            return Err("ArgumentError: Error #2008: Parameter blendMode must be one of the accepted values.".into());
         }
     }
+    Ok(Value::Undefined)
+}
 
+fn new_rectangle<'gc>(
+    activation: &mut Activation<'_, 'gc, '_>,
+    rectangle: Rectangle<Twips>,
+) -> Result<Object<'gc>, Error<'gc>> {
+    let x = rectangle.x_min.to_pixels();
+    let y = rectangle.y_min.to_pixels();
+    let width = (rectangle.x_max - rectangle.x_min).to_pixels();
+    let height = (rectangle.y_max - rectangle.y_min).to_pixels();
+    let args = &[x.into(), y.into(), width.into(), height.into()];
+    activation
+        .avm2()
+        .classes()
+        .rectangle
+        .construct(activation, args)
+}
+
+fn scroll_rect<'gc>(
+    activation: &mut Activation<'_, 'gc, '_>,
+    this: Option<Object<'gc>>,
+    _args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    if let Some(dobj) = this.and_then(|this| this.as_display_object()) {
+        if dobj.has_scroll_rect() {
+            return Ok(new_rectangle(activation, dobj.next_scroll_rect())?.into());
+        } else {
+            return Ok(Value::Null);
+        }
+    }
+    Ok(Value::Undefined)
+}
+
+fn object_to_rectangle<'gc>(
+    activation: &mut Activation<'_, 'gc, '_>,
+    object: Object<'gc>,
+) -> Result<Rectangle<Twips>, Error<'gc>> {
+    const NAMES: &[&str] = &["x", "y", "width", "height"];
+    let mut values = [0.0; 4];
+    for (&name, value) in NAMES.iter().zip(&mut values) {
+        *value = object
+            .get_property(&Multiname::public(name), activation)?
+            .coerce_to_number(activation)?;
+    }
+    let [x, y, width, height] = values;
+    Ok(Rectangle {
+        x_min: Twips::from_pixels_i32(round_to_even(x)),
+        y_min: Twips::from_pixels_i32(round_to_even(y)),
+        x_max: Twips::from_pixels_i32(round_to_even(x + width)),
+        y_max: Twips::from_pixels_i32(round_to_even(y + height)),
+    })
+}
+
+fn set_scroll_rect<'gc>(
+    activation: &mut Activation<'_, 'gc, '_>,
+    this: Option<Object<'gc>>,
+    args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    if let Some(dobj) = this.and_then(|this| this.as_display_object()) {
+        if let Some(rectangle) = args[0].as_object() {
+            // Flash only updates the "internal" scrollRect used by `localToLocal` when the next
+            // frame is rendered. However, accessing `DisplayObject.scrollRect` from ActionScript
+            // will immediately return the updated value.
+            //
+            // To implement this, our `DisplayObject.scrollRect` ActionScript getter/setter both
+            // operate on a `next_scroll_rect` field. Just before we render a DisplayObject, we copy
+            // its `next_scroll_rect` to the `scroll_rect` field used for both rendering and
+            // `localToGlobal`.
+            dobj.set_next_scroll_rect(
+                activation.context.gc_context,
+                object_to_rectangle(activation, rectangle)?,
+            );
+
+            // TODO: Technically we should accept only `flash.geom.Rectangle` objects, in which case
+            // `object_to_rectangle` will be infallible. Once this happens, the following line can
+            // be moved above the `set_next_scroll_rect` call.
+            dobj.set_has_scroll_rect(activation.context.gc_context, true);
+        } else {
+            dobj.set_has_scroll_rect(activation.context.gc_context, false);
+        }
+    }
+    Ok(Value::Undefined)
+}
+
+fn local_to_global<'gc>(
+    activation: &mut Activation<'_, 'gc, '_>,
+    this: Option<Object<'gc>>,
+    args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    if let Some(dobj) = this.and_then(|this| this.as_display_object()) {
+        let point = args
+            .get(0)
+            .unwrap_or(&Value::Undefined)
+            .coerce_to_object(activation)?;
+        let x = point
+            .get_property(&Multiname::public("x"), activation)?
+            .coerce_to_number(activation)?;
+        let y = point
+            .get_property(&Multiname::public("y"), activation)?
+            .coerce_to_number(activation)?;
+
+        let (out_x, out_y) = dobj.local_to_global((Twips::from_pixels(x), Twips::from_pixels(y)));
+        return Ok(activation
+            .avm2()
+            .classes()
+            .point
+            .construct(
+                activation,
+                &[out_x.to_pixels().into(), out_y.to_pixels().into()],
+            )?
+            .into());
+    }
+
+    Ok(Value::Undefined)
+}
+
+fn global_to_local<'gc>(
+    activation: &mut Activation<'_, 'gc, '_>,
+    this: Option<Object<'gc>>,
+    args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    if let Some(dobj) = this.and_then(|this| this.as_display_object()) {
+        let point = args
+            .get(0)
+            .unwrap_or(&Value::Undefined)
+            .coerce_to_object(activation)?;
+        let x = point
+            .get_property(&Multiname::public("x"), activation)?
+            .coerce_to_number(activation)?;
+        let y = point
+            .get_property(&Multiname::public("y"), activation)?
+            .coerce_to_number(activation)?;
+
+        let (out_x, out_y) = dobj.global_to_local((Twips::from_pixels(x), Twips::from_pixels(y)));
+        return Ok(activation
+            .avm2()
+            .classes()
+            .point
+            .construct(
+                activation,
+                &[out_x.to_pixels().into(), out_y.to_pixels().into()],
+            )?
+            .into());
+    }
+
+    Ok(Value::Undefined)
+}
+
+fn mask<'gc>(
+    _activation: &mut Activation<'_, 'gc, '_>,
+    this: Option<Object<'gc>>,
+    _args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    if let Some(this) = this.and_then(|this| this.as_display_object()) {
+        return Ok(this.masker().map_or(Value::Null, |m| m.object2()));
+    }
+    Ok(Value::Undefined)
+}
+
+fn set_mask<'gc>(
+    activation: &mut Activation<'_, 'gc, '_>,
+    this: Option<Object<'gc>>,
+    args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    if let Some(this) = this.and_then(|this| this.as_display_object()) {
+        let mask = args.get(0).unwrap_or(&Value::Null);
+
+        if matches!(mask, Value::Null) {
+            this.set_masker(activation.context.gc_context, None, true);
+        } else {
+            let mask = mask
+                .coerce_to_object(activation)?
+                .as_display_object()
+                .ok_or_else(|| -> Error {
+                    format!("Mask is not a DisplayObject: {:?}", mask).into()
+                })?;
+
+            this.set_masker(activation.context.gc_context, Some(mask), true);
+            mask.set_maskee(activation.context.gc_context, Some(this), true);
+        }
+    }
     Ok(Value::Undefined)
 }
 
@@ -588,7 +955,10 @@ pub fn loader_info<'gc>(
 pub fn create_class<'gc>(mc: MutationContext<'gc, '_>) -> GcCell<'gc, Class<'gc>> {
     let class = Class::new(
         QName::new(Namespace::package("flash.display"), "DisplayObject"),
-        Some(QName::new(Namespace::package("flash.events"), "EventDispatcher").into()),
+        Some(Multiname::new(
+            Namespace::package("flash.events"),
+            "EventDispatcher",
+        )),
         Method::from_builtin(instance_init, "<DisplayObject instance initializer>", mc),
         Method::from_builtin(class_init, "<DisplayObject class initializer>", mc),
         mc,
@@ -603,7 +973,10 @@ pub fn create_class<'gc>(mc: MutationContext<'gc, '_>) -> GcCell<'gc, Class<'gc>
         mc,
     ));
 
-    write.implements(QName::new(Namespace::package("flash.display"), "IBitmapDrawable").into());
+    write.implements(Multiname::new(
+        Namespace::package("flash.display"),
+        "IBitmapDrawable",
+    ));
 
     const PUBLIC_INSTANCE_PROPERTIES: &[(
         &str,
@@ -611,13 +984,19 @@ pub fn create_class<'gc>(mc: MutationContext<'gc, '_>) -> GcCell<'gc, Class<'gc>
         Option<NativeMethodImpl>,
     )] = &[
         ("alpha", Some(alpha), Some(set_alpha)),
+        ("blendMode", Some(blend_mode), Some(set_blend_mode)),
         ("height", Some(height), Some(set_height)),
         ("scaleY", Some(scale_y), Some(set_scale_y)),
         ("width", Some(width), Some(set_width)),
         ("scaleX", Some(scale_x), Some(set_scale_x)),
         ("x", Some(x), Some(set_x)),
         ("y", Some(y), Some(set_y)),
+        ("z", Some(z), Some(set_z)), //TODO: This property needs to be version-gated to SWF10+
         ("rotation", Some(rotation), Some(set_rotation)),
+        ("rotationX", Some(rotation_x), Some(set_rotation_x)),
+        ("rotationY", Some(rotation_y), Some(set_rotation_y)),
+        ("rotationZ", Some(rotation_z), Some(set_rotation_z)),
+        ("scaleZ", Some(scale_z), Some(set_scale_z)),
         ("name", Some(name), Some(set_name)),
         ("parent", Some(parent), None),
         ("root", Some(root), None),
@@ -626,12 +1005,18 @@ pub fn create_class<'gc>(mc: MutationContext<'gc, '_>) -> GcCell<'gc, Class<'gc>
         ("mouseX", Some(mouse_x), None),
         ("mouseY", Some(mouse_y), None),
         ("loaderInfo", Some(loader_info), None),
+        ("filters", Some(filters), Some(set_filters)),
+        ("transform", Some(transform), Some(set_transform)),
+        ("scrollRect", Some(scroll_rect), Some(set_scroll_rect)),
+        ("mask", Some(mask), Some(set_mask)),
     ];
     write.define_public_builtin_instance_properties(mc, PUBLIC_INSTANCE_PROPERTIES);
 
     const PUBLIC_INSTANCE_METHODS: &[(&str, NativeMethodImpl)] = &[
         ("hitTestPoint", hit_test_point),
         ("hitTestObject", hit_test_object),
+        ("localToGlobal", local_to_global),
+        ("globalToLocal", global_to_local),
     ];
     write.define_public_builtin_instance_methods(mc, PUBLIC_INSTANCE_METHODS);
 

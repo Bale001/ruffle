@@ -3,10 +3,12 @@
 use crate::avm2::activation::Activation;
 use crate::avm2::class::Class;
 use crate::avm2::method::{Method, NativeMethodImpl};
-use crate::avm2::names::{Namespace, QName};
 use crate::avm2::object::{qname_allocator, FunctionObject, Object, TObject};
 use crate::avm2::value::Value;
 use crate::avm2::Error;
+use crate::avm2::Multiname;
+use crate::avm2::Namespace;
+use crate::avm2::QName;
 use gc_arena::{GcCell, MutationContext};
 
 /// Implements `QName`'s instance initializer.
@@ -14,7 +16,7 @@ pub fn instance_init<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(this) = this.and_then(|t| t.as_qname_object()) {
         if this.qname().is_none() {
             let (namespace, local_arg) = if args.len() > 1 {
@@ -62,14 +64,14 @@ pub fn class_init<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     _args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     let this = this.unwrap();
     let scope = activation.create_scopechain();
     let this_class = this.as_class_object().unwrap();
     let mut qname_proto = this_class.prototype();
 
     qname_proto.set_property(
-        &QName::dynamic_name("toString").into(),
+        &Multiname::public("toString"),
         FunctionObject::from_method(
             activation,
             Method::from_builtin(to_string, "toString", activation.context.gc_context),
@@ -82,7 +84,7 @@ pub fn class_init<'gc>(
     )?;
 
     qname_proto.set_property(
-        &QName::dynamic_name("valueOf").into(),
+        &Multiname::public("valueOf"),
         FunctionObject::from_method(
             activation,
             Method::from_builtin(value_of, "valueOf", activation.context.gc_context),
@@ -98,12 +100,12 @@ pub fn class_init<'gc>(
         activation.context.gc_context,
         "toString".into(),
         false,
-    )?;
+    );
     qname_proto.set_local_property_is_enumerable(
         activation.context.gc_context,
         "valueOf".into(),
         false,
-    )?;
+    );
 
     Ok(Value::Undefined)
 }
@@ -113,7 +115,7 @@ pub fn local_name<'gc>(
     _activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     _args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(this) = this.and_then(|t| t.as_qname_object()) {
         if let Some(qname) = this.qname() {
             return Ok(qname.local_name().into());
@@ -128,7 +130,7 @@ pub fn uri<'gc>(
     _activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     _args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(this) = this.and_then(|t| t.as_qname_object()) {
         if let Some(qname) = this.qname() {
             return Ok(match qname.namespace() {
@@ -146,7 +148,7 @@ pub fn to_string<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     _args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(this) = this.and_then(|t| t.as_qname_object()) {
         if let Some(qname) = this.qname() {
             return Ok(qname.as_uri(activation.context.gc_context).into());
@@ -161,7 +163,7 @@ pub fn value_of<'gc>(
     _activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     _args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(this) = this {
         return Ok(this.into());
     }
@@ -173,7 +175,7 @@ pub fn value_of<'gc>(
 pub fn create_class<'gc>(mc: MutationContext<'gc, '_>) -> GcCell<'gc, Class<'gc>> {
     let class = Class::new(
         QName::new(Namespace::public(), "QName"),
-        Some(QName::new(Namespace::public(), "Object").into()),
+        Some(Multiname::public("Object")),
         Method::from_builtin(instance_init, "<QName instance initializer>", mc),
         Method::from_builtin(class_init, "<QName class initializer>", mc),
         mc,

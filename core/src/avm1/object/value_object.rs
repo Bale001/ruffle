@@ -42,16 +42,16 @@ impl<'gc> ValueObject<'gc> {
             ob
         } else {
             let proto = match &value {
-                Value::Bool(_) => Some(activation.context.avm1.prototypes.boolean),
-                Value::Number(_) => Some(activation.context.avm1.prototypes.number),
-                Value::String(_) => Some(activation.context.avm1.prototypes.string),
+                Value::Bool(_) => Some(activation.context.avm1.prototypes().boolean),
+                Value::Number(_) => Some(activation.context.avm1.prototypes().number),
+                Value::String(_) => Some(activation.context.avm1.prototypes().string),
                 _ => None,
             };
 
             let obj = ValueObject(GcCell::allocate(
                 activation.context.gc_context,
                 ValueObjectData {
-                    base: ScriptObject::object(activation.context.gc_context, proto),
+                    base: ScriptObject::new(activation.context.gc_context, proto),
                     value: Value::Undefined,
                 },
             ));
@@ -86,7 +86,7 @@ impl<'gc> ValueObject<'gc> {
         ValueObject(GcCell::allocate(
             gc_context,
             ValueObjectData {
-                base: ScriptObject::object(gc_context, proto),
+                base: ScriptObject::new(gc_context, proto),
                 value: Value::Undefined,
             },
         ))

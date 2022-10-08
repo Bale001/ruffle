@@ -1,3 +1,5 @@
 //! `flash.ui` namespace
 
-pub mod contextmenu;
+pub mod context_menu;
+pub mod keyboard;
+pub mod mouse;

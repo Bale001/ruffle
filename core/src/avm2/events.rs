@@ -1,10 +1,11 @@
 //! Core event structure
 
 use crate::avm2::activation::Activation;
-use crate::avm2::names::{Namespace, QName};
 use crate::avm2::object::{Object, TObject};
 use crate::avm2::value::Value;
 use crate::avm2::Error;
+use crate::avm2::Multiname;
+use crate::avm2::Namespace;
 use crate::display_object::TDisplayObject;
 use crate::string::AvmString;
 use fnv::FnvHashMap;
@@ -371,7 +372,7 @@ pub fn dispatch_event_to_target<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     target: Object<'gc>,
     event: Object<'gc>,
-) -> Result<(), Error> {
+) -> Result<(), Error<'gc>> {
     avm_debug!(
         activation.context.avm2,
         "Event dispatch: {} to {:?}",
@@ -380,12 +381,12 @@ pub fn dispatch_event_to_target<'gc>(
     );
     let dispatch_list = target
         .get_property(
-            &QName::new(Namespace::private(NS_EVENT_DISPATCHER), "dispatch_list").into(),
+            &Multiname::new(Namespace::private(NS_EVENT_DISPATCHER), "dispatch_list"),
             activation,
         )?
-        .coerce_to_object(activation);
+        .as_object();
 
-    if dispatch_list.is_err() {
+    if dispatch_list.is_none() {
         // Objects with no dispatch list act as if they had an empty one
         return Ok(());
     }
@@ -417,7 +418,14 @@ pub fn dispatch_event_to_target<'gc>(
 
         let object = activation.global_scope();
 
-        handler.call(object, &[event.into()], activation)?;
+        if let Err(err) = handler.call(object, &[event.into()], activation) {
+            log::error!(
+                "Error dispatching event {:?} to handler {:?} : {:?}",
+                event,
+                handler,
+                err
+            );
+        }
     }
 
     Ok(())
@@ -427,14 +435,13 @@ pub fn dispatch_event<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     this: Object<'gc>,
     event: Object<'gc>,
-) -> Result<bool, Error> {
+) -> Result<bool, Error<'gc>> {
     let target = this
         .get_property(
-            &QName::new(Namespace::private(NS_EVENT_DISPATCHER), "target").into(),
+            &Multiname::new(Namespace::private(NS_EVENT_DISPATCHER), "target"),
             activation,
         )?
-        .coerce_to_object(activation)
-        .ok()
+        .as_object()
         .unwrap_or(this);
 
     let mut ancestor_list = Vec::new();

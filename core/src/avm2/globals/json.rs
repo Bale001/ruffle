@@ -5,38 +5,35 @@ use crate::avm2::array::ArrayStorage;
 use crate::avm2::class::Class;
 use crate::avm2::globals::array::ArrayIter;
 use crate::avm2::method::{Method, NativeMethodImpl};
-use crate::avm2::names::{Namespace, QName};
 use crate::avm2::object::{ArrayObject, FunctionObject, Object, TObject};
 use crate::avm2::value::Value;
 use crate::avm2::Error;
+use crate::avm2::Multiname;
+use crate::avm2::Namespace;
+use crate::avm2::QName;
 use crate::ecma_conversions::f64_to_wrapping_i32;
-use crate::string::AvmString;
+use crate::string::{AvmString, Units};
 use gc_arena::{GcCell, MutationContext};
-use json::{
-    codegen::Generator as JsonGenerator, object::Object as JsonObject, parse as parse_json,
-    JsonValue,
-};
-use std::cmp;
+use serde::Serialize;
+use serde_json::{Map as JsonObject, Value as JsonValue};
+use std::borrow::Cow;
 use std::ops::Deref;
 
 fn deserialize_json_inner<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     json: JsonValue,
     reviver: Option<Object<'gc>>,
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     Ok(match json {
         JsonValue::Null => Value::Null,
-        JsonValue::Short(s) => {
-            AvmString::new_utf8(activation.context.gc_context, s.to_string()).into()
-        }
         JsonValue::String(s) => AvmString::new_utf8(activation.context.gc_context, s).into(),
-        JsonValue::Boolean(b) => b.into(),
-        JsonValue::Number(num) => {
-            let num: f64 = num.into();
-            if num.fract() == 0.0 {
-                f64_to_wrapping_i32(num).into()
+        JsonValue::Bool(b) => b.into(),
+        JsonValue::Number(number) => {
+            let number = number.as_f64().unwrap();
+            if number.fract() == 0.0 {
+                f64_to_wrapping_i32(number).into()
             } else {
-                num.into()
+                number.into()
             }
         }
         JsonValue::Object(js_obj) => {
@@ -50,9 +47,9 @@ fn deserialize_json_inner<'gc>(
                     Some(reviver) => reviver.call(None, &[key.into(), val], activation)?,
                 };
                 if matches!(mapped_val, Value::Undefined) {
-                    obj.delete_property(activation, &QName::dynamic_name(key).into())?;
+                    obj.delete_property(activation, &Multiname::public(key))?;
                 } else {
-                    obj.set_property(&QName::dynamic_name(key).into(), mapped_val, activation)?;
+                    obj.set_property(&Multiname::public(key), mapped_val, activation)?;
                 }
             }
             obj.into()
@@ -78,77 +75,11 @@ fn deserialize_json<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     json: JsonValue,
     reviver: Option<Object<'gc>>,
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     let val = deserialize_json_inner(activation, json, reviver)?;
     match reviver {
         None => Ok(val),
         Some(reviver) => reviver.call(None, &["".into(), val], activation),
-    }
-}
-
-/// This is a custom generator backend for the json crate that allows modifying the indentation character.
-/// This generator is used in `JSON.stringify` when a string is passed to the `space` parameter.
-struct FlashStrGenerator<'a> {
-    code: Vec<u8>,
-    indent_str: &'a str,
-    indent_size: u16,
-}
-
-impl<'a> FlashStrGenerator<'a> {
-    fn new(indent_str: &'a str) -> Self {
-        Self {
-            code: Vec::with_capacity(1024),
-            indent_str,
-            indent_size: 0,
-        }
-    }
-
-    pub fn consume(self) -> String {
-        // SAFETY: JSON crate should never generate invalid UTF-8
-        unsafe { String::from_utf8_unchecked(self.code) }
-    }
-}
-
-impl<'a> JsonGenerator for FlashStrGenerator<'a> {
-    type T = Vec<u8>;
-
-    #[inline(always)]
-    fn write(&mut self, slice: &[u8]) -> std::io::Result<()> {
-        self.code.extend_from_slice(slice);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn write_char(&mut self, ch: u8) -> std::io::Result<()> {
-        self.code.push(ch);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn get_writer(&mut self) -> &mut Vec<u8> {
-        &mut self.code
-    }
-
-    #[inline(always)]
-    fn write_min(&mut self, slice: &[u8], _: u8) -> std::io::Result<()> {
-        self.code.extend_from_slice(slice);
-        Ok(())
-    }
-
-    fn new_line(&mut self) -> std::io::Result<()> {
-        self.code.push(b'\n');
-        for _ in 0..self.indent_size {
-            self.code.extend_from_slice(self.indent_str.as_bytes());
-        }
-        Ok(())
-    }
-
-    fn indent(&mut self) {
-        self.indent_size += 1;
-    }
-
-    fn dedent(&mut self) {
-        self.indent_size -= 1;
     }
 }
 
@@ -187,18 +118,14 @@ impl<'gc> AvmSerializer<'gc> {
         activation: &mut Activation<'_, 'gc, '_>,
         key: impl Fn() -> AvmString<'gc>,
         value: Value<'gc>,
-    ) -> Result<Value<'gc>, Error> {
+    ) -> Result<Value<'gc>, Error<'gc>> {
         let (eval_key, value) = if value.is_primitive() {
             (None, value)
         } else {
-            let obj = value.coerce_to_object(activation)?;
+            let obj = value.as_object().unwrap();
             let to_json = obj
-                .get_property(
-                    &QName::new(Namespace::public(), "toJSON").into(),
-                    activation,
-                )?
-                .coerce_to_object(activation)
-                .ok()
+                .get_property(&Multiname::public("toJSON"), activation)?
+                .as_object()
                 .and_then(|obj| obj.as_function_object());
             if let Some(to_json) = to_json {
                 let key = key();
@@ -222,7 +149,7 @@ impl<'gc> AvmSerializer<'gc> {
         &mut self,
         activation: &mut Activation<'_, 'gc, '_>,
         obj: Object<'gc>,
-    ) -> Result<JsonValue, Error> {
+    ) -> Result<JsonValue, Error<'gc>> {
         let mut js_obj = JsonObject::new();
         // If the user supplied a PropList, we use that to find properties on the object.
         if let Some(Replacer::PropList(props)) = self.replacer {
@@ -230,12 +157,11 @@ impl<'gc> AvmSerializer<'gc> {
             while let Some(r) = iter.next(activation) {
                 let item = r?.1;
                 let key = item.coerce_to_string(activation)?;
-                let value =
-                    obj.get_property(&QName::new(Namespace::public(), key).into(), activation)?;
+                let value = obj.get_property(&Multiname::public(key), activation)?;
                 let mapped = self.map_value(activation, || key, value)?;
                 if !matches!(mapped, Value::Undefined) {
                     js_obj.insert(
-                        &key.to_utf8_lossy(),
+                        key.to_utf8_lossy().into_owned(),
                         self.serialize_value(activation, mapped)?,
                     );
                 }
@@ -247,12 +173,11 @@ impl<'gc> AvmSerializer<'gc> {
                     Value::Undefined => break,
                     name_val => {
                         let name = name_val.coerce_to_string(activation)?;
-                        let value =
-                            obj.get_property(&QName::dynamic_name(name).into(), activation)?;
+                        let value = obj.get_property(&Multiname::public(name), activation)?;
                         let mapped = self.map_value(activation, || name, value)?;
                         if !matches!(mapped, Value::Undefined) {
                             js_obj.insert(
-                                &name.to_utf8_lossy(),
+                                name.to_utf8_lossy().into_owned(),
                                 self.serialize_value(activation, mapped)?,
                             );
                         }
@@ -269,7 +194,7 @@ impl<'gc> AvmSerializer<'gc> {
         &mut self,
         activation: &mut Activation<'_, 'gc, '_>,
         iterable: Object<'gc>,
-    ) -> Result<JsonValue, Error> {
+    ) -> Result<JsonValue, Error<'gc>> {
         let mut js_arr = Vec::new();
         let mut iter = ArrayIter::new(activation, iterable)?;
         while let Some(r) = iter.next(activation) {
@@ -286,12 +211,11 @@ impl<'gc> AvmSerializer<'gc> {
         &mut self,
         activation: &mut Activation<'_, 'gc, '_>,
         value: Value<'gc>,
-    ) -> Result<JsonValue, Error> {
+    ) -> Result<JsonValue, Error<'gc>> {
         Ok(match value {
             Value::Null => JsonValue::Null,
             Value::Undefined => JsonValue::Null,
             Value::Integer(i) => JsonValue::from(i),
-            Value::Unsigned(u) => JsonValue::from(u),
             Value::Number(n) => JsonValue::from(n),
             Value::Bool(b) => JsonValue::from(b),
             Value::String(s) => JsonValue::from(s.to_utf8_lossy().deref()),
@@ -304,7 +228,7 @@ impl<'gc> AvmSerializer<'gc> {
                     return Err("TypeError: Error #1129: Cyclic structure cannot be converted to JSON string.".into());
                 }
                 self.obj_stack.push(obj);
-                let value = if obj.is_of_type(activation.avm2().classes().array, activation)? {
+                let value = if obj.is_of_type(activation.avm2().classes().array, activation) {
                     // TODO: Vectors
                     self.serialize_iterable(activation, obj)?
                 } else {
@@ -323,7 +247,7 @@ impl<'gc> AvmSerializer<'gc> {
         &mut self,
         activation: &mut Activation<'_, 'gc, '_>,
         value: Value<'gc>,
-    ) -> Result<JsonValue, Error> {
+    ) -> Result<JsonValue, Error<'gc>> {
         let mapped = self.map_value(activation, || "".into(), value)?;
         self.serialize_value(activation, mapped)
     }
@@ -334,7 +258,7 @@ pub fn instance_init<'gc>(
     _activation: &mut Activation<'_, 'gc, '_>,
     _this: Option<Object<'gc>>,
     _args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     Err("ArgumentError: Error #2012: JSON class cannot be instantiated.".into())
 }
 
@@ -343,7 +267,7 @@ pub fn class_init<'gc>(
     _activation: &mut Activation<'_, 'gc, '_>,
     _this: Option<Object<'gc>>,
     _args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     Ok(Value::Undefined)
 }
 
@@ -352,17 +276,13 @@ pub fn parse<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     _this: Option<Object<'gc>>,
     args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     let input = args
         .get(0)
         .unwrap_or(&Value::Undefined)
         .coerce_to_string(activation)?;
-    let reviver = args
-        .get(1)
-        .unwrap_or(&Value::Undefined)
-        .coerce_to_object(activation)
-        .ok();
-    let parsed = parse_json(&input.to_utf8_lossy())
+    let reviver = args.get(1).unwrap_or(&Value::Undefined).as_object();
+    let parsed = serde_json::from_str(&input.to_utf8_lossy())
         .map_err(|_| "SyntaxError: Error #1132: Invalid JSON parse input.")?;
     deserialize_json(activation, parsed, reviver)
 }
@@ -372,13 +292,9 @@ pub fn stringify<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     _this: Option<Object<'gc>>,
     args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     let val = args.get(0).unwrap_or(&Value::Undefined);
-    let replacer = args
-        .get(1)
-        .unwrap_or(&Value::Undefined)
-        .coerce_to_object(activation)
-        .ok();
+    let replacer = args.get(1).unwrap_or(&Value::Undefined).as_object();
     let spaces = args.get(2).unwrap_or(&Value::Undefined);
     let replacer = replacer.map(|replacer| {
         if let Some(func) = replacer.as_function_object() {
@@ -390,19 +306,18 @@ pub fn stringify<'gc>(
         }
     }).transpose()?;
 
-    let mut serializer = AvmSerializer::new(replacer);
-    let result = serializer.serialize(activation, *val)?;
     // NOTE: We do not coerce to a string or to a number, the value must already be a string or number.
-    let output = if let Value::String(s) = spaces {
-        // If the string is empty, just use the normal dump generator.
+    let indent = if let Value::String(s) = spaces {
         if s.is_empty() {
-            result.dump()
+            None
         } else {
-            // we can only use the first 10 characters
-            let indent = s.slice(..cmp::min(s.len(), 10)).unwrap().to_utf8_lossy();
-            let mut gen = FlashStrGenerator::new(&indent);
-            gen.write_json(&result).expect("Can't fail");
-            gen.consume()
+            // We can only use the first 10 characters.
+            let indent = &s[..s.len().min(10)];
+            let indent_bytes = match indent.units() {
+                Units::Bytes(units) => Cow::Borrowed(units),
+                Units::Wide(_) => Cow::Owned(indent.to_utf8_lossy().into_owned().into_bytes()),
+            };
+            Some(indent_bytes)
         }
     } else {
         let indent_size = spaces
@@ -410,19 +325,33 @@ pub fn stringify<'gc>(
             .unwrap_or(0.0)
             .clamp(0.0, 10.0) as u16;
         if indent_size == 0 {
-            result.dump()
+            None
         } else {
-            result.pretty(indent_size)
+            Some(Cow::Owned(b" ".repeat(indent_size.into())))
         }
     };
-    Ok(AvmString::new_utf8(activation.context.gc_context, output).into())
+
+    let mut serializer = AvmSerializer::new(replacer);
+    let json = serializer.serialize(activation, *val)?;
+    let result = match indent {
+        Some(indent) => {
+            let mut result = Vec::with_capacity(128);
+            let formatter = serde_json::ser::PrettyFormatter::with_indent(&indent);
+            let mut serializer = serde_json::Serializer::with_formatter(&mut result, formatter);
+            json.serialize(&mut serializer)
+                .expect("JSON serialization cannot fail");
+            result
+        }
+        None => serde_json::to_vec(&json).expect("JSON serialization cannot fail"),
+    };
+    Ok(AvmString::new_utf8_bytes(activation.context.gc_context, &result).into())
 }
 
 /// Construct `JSON`'s class.
 pub fn create_class<'gc>(mc: MutationContext<'gc, '_>) -> GcCell<'gc, Class<'gc>> {
     let class = Class::new(
         QName::new(Namespace::public(), "JSON"),
-        Some(QName::new(Namespace::public(), "Object").into()),
+        Some(Multiname::public("Object")),
         Method::from_builtin(instance_init, "<JSON instance initializer>", mc),
         Method::from_builtin(class_init, "<JSON class initializer>", mc),
         mc,

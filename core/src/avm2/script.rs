@@ -5,9 +5,11 @@ use crate::avm2::class::Class;
 use crate::avm2::domain::Domain;
 use crate::avm2::method::{BytecodeMethod, Method};
 use crate::avm2::object::{Object, TObject};
+use crate::avm2::property_map::PropertyMap;
 use crate::avm2::scope::ScopeChain;
 use crate::avm2::traits::Trait;
 use crate::avm2::value::Value;
+use crate::avm2::Multiname;
 use crate::avm2::{Avm2, Error};
 use crate::context::UpdateContext;
 use crate::string::AvmString;
@@ -15,7 +17,9 @@ use gc_arena::{Collect, Gc, GcCell, MutationContext};
 use std::cell::Ref;
 use std::mem::drop;
 use std::rc::Rc;
-use swf::avm2::types::{AbcFile, Index, Method as AbcMethod, Script as AbcScript};
+use swf::avm2::types::{
+    AbcFile, Index, Method as AbcMethod, Multiname as AbcMultiname, Script as AbcScript,
+};
 
 #[derive(Copy, Clone, Debug, Collect)]
 #[collect(no_drop)]
@@ -55,33 +59,71 @@ pub struct TranslationUnitData<'gc> {
     /// All strings loaded from the ABC's strings list.
     /// They're lazy loaded and offset by 1, with the 0th element being always None.
     strings: Vec<Option<AvmString<'gc>>>,
+
+    /// All multinames loaded from the ABC's multiname list
+    /// Note that some of these may have a runtime (lazy) component.
+    /// Make sure to check for that before using them.
+    multinames: Vec<Option<Gc<'gc, Multiname<'gc>>>>,
+
+    /// A map from trait names to their defining `Scripts`.
+    /// This is very similar to `Domain.defs`, except it
+    /// only stores traits with `Namespace::Private`, which are
+    /// not exported/stored in `Domain`.
+    ///
+    /// This should only be used in very specific circumstances -
+    /// such as resolving classes for property types. All other
+    /// lookups should go through `Activation.resolve_definition`,
+    /// which takes scopes and privacy into account.
+    ///
+    /// Note that this map is 'gradually' populated over time -
+    /// each call to `script.load_traits` inserts all private
+    /// traits declared by that script. When looking up a
+    /// trait name in this map, you must ensure that its
+    /// corresponing `Script` will have already been loaded.
+    private_trait_scripts: PropertyMap<'gc, Script<'gc>>,
 }
 
 impl<'gc> TranslationUnit<'gc> {
     /// Construct a new `TranslationUnit` for a given ABC file intended to
     /// execute within a particular domain.
-    pub fn from_abc(abc: Rc<AbcFile>, domain: Domain<'gc>, mc: MutationContext<'gc, '_>) -> Self {
+    pub fn from_abc(abc: AbcFile, domain: Domain<'gc>, mc: MutationContext<'gc, '_>) -> Self {
         let classes = vec![None; abc.classes.len()];
         let methods = vec![None; abc.methods.len()];
         let scripts = vec![None; abc.scripts.len()];
         let strings = vec![None; abc.constant_pool.strings.len() + 1];
+        let multinames = vec![None; abc.constant_pool.multinames.len() + 1];
+        let private_trait_scripts = PropertyMap::new();
 
         Self(GcCell::allocate(
             mc,
             TranslationUnitData {
                 domain,
-                abc,
+                abc: Rc::new(abc),
                 classes,
                 methods,
                 scripts,
                 strings,
+                multinames,
+                private_trait_scripts,
             },
         ))
+    }
+
+    pub fn domain(self) -> Domain<'gc> {
+        self.0.read().domain
     }
 
     /// Retrieve the underlying `AbcFile` for this translation unit.
     pub fn abc(self) -> Rc<AbcFile> {
         self.0.read().abc.clone()
+    }
+
+    pub fn get_loaded_private_trait_script(self, name: &Multiname<'gc>) -> Option<Script<'gc>> {
+        self.0
+            .read()
+            .private_trait_scripts
+            .get_for_multiname(name)
+            .copied()
     }
 
     /// Load a method from the ABC file and return its method definition.
@@ -90,17 +132,38 @@ impl<'gc> TranslationUnit<'gc> {
         method_index: Index<AbcMethod>,
         is_function: bool,
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<Method<'gc>, Error> {
+    ) -> Result<Method<'gc>, Error<'gc>> {
         let read = self.0.read();
         if let Some(Some(method)) = read.methods.get(method_index.0 as usize) {
             return Ok(method.clone());
         }
 
+        let is_global = read.domain.is_avm2_global_domain(activation);
         drop(read);
 
-        let method: Result<Gc<'gc, BytecodeMethod<'gc>>, Error> =
-            BytecodeMethod::from_method_index(self, method_index, is_function, activation);
-        let method: Method<'gc> = method?.into();
+        let bc_method =
+            BytecodeMethod::from_method_index(self, method_index, is_function, activation)?;
+
+        // This closure lets us move out of 'bc_method.signature' and then return,
+        // allowing us to use 'bc_method' later on without a borrow-checker error.
+        let method = (|| {
+            if is_global {
+                if let Some((name, native)) =
+                    activation.avm2().native_method_table[method_index.0 as usize]
+                {
+                    let variadic = bc_method.is_variadic();
+                    // Set the method name and function pointer from the table.
+                    return Method::from_builtin_and_params(
+                        native,
+                        name,
+                        bc_method.signature,
+                        variadic,
+                        activation.context.gc_context,
+                    );
+                }
+            }
+            Gc::allocate(activation.context.gc_context, bc_method).into()
+        })();
 
         self.0.write(activation.context.gc_context).methods[method_index.0 as usize] =
             Some(method.clone());
@@ -113,7 +176,7 @@ impl<'gc> TranslationUnit<'gc> {
         self,
         class_index: u32,
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<GcCell<'gc, Class<'gc>>, Error> {
+    ) -> Result<GcCell<'gc, Class<'gc>>, Error<'gc>> {
         let read = self.0.read();
         if let Some(Some(class)) = read.classes.get(class_index as usize) {
             return Ok(*class);
@@ -136,7 +199,7 @@ impl<'gc> TranslationUnit<'gc> {
         self,
         script_index: u32,
         uc: &mut UpdateContext<'_, 'gc, '_>,
-    ) -> Result<Script<'gc>, Error> {
+    ) -> Result<Script<'gc>, Error<'gc>> {
         let read = self.0.read();
         if let Some(Some(scripts)) = read.scripts.get(script_index as usize) {
             return Ok(*scripts);
@@ -170,7 +233,7 @@ impl<'gc> TranslationUnit<'gc> {
         self,
         string_index: u32,
         mc: MutationContext<'gc, '_>,
-    ) -> Result<Option<AvmString<'gc>>, Error> {
+    ) -> Result<Option<AvmString<'gc>>, Error<'gc>> {
         let mut write = self.0.write(mc);
         if let Some(Some(string)) = write.strings.get(string_index as usize) {
             return Ok(Some(*string));
@@ -204,10 +267,64 @@ impl<'gc> TranslationUnit<'gc> {
         self,
         string_index: u32,
         mc: MutationContext<'gc, '_>,
-    ) -> Result<AvmString<'gc>, Error> {
+    ) -> Result<AvmString<'gc>, Error<'gc>> {
         Ok(self
             .pool_string_option(string_index, mc)?
             .unwrap_or_default())
+    }
+
+    /// Retrieve a multiname from the current constant pool.
+    /// The name can have a lazy component, do not pass it anywhere.
+    pub fn pool_maybe_uninitialized_multiname(
+        self,
+        multiname_index: Index<AbcMultiname>,
+        mc: MutationContext<'gc, '_>,
+    ) -> Result<Gc<'gc, Multiname<'gc>>, Error<'gc>> {
+        let read = self.0.read();
+        if let Some(Some(multiname)) = read.multinames.get(multiname_index.0 as usize) {
+            return Ok(*multiname);
+        }
+
+        drop(read);
+
+        let multiname = Multiname::from_abc_index(self, multiname_index, mc)?;
+        let multiname = Gc::allocate(mc, multiname);
+        self.0.write(mc).multinames[multiname_index.0 as usize] = Some(multiname);
+
+        Ok(multiname)
+    }
+
+    /// Retrieve a static, or non-runtime, multiname from the current constant
+    /// pool.
+    ///
+    /// This version of the function treats index 0 as an error condition.
+    pub fn pool_multiname_static(
+        self,
+        multiname_index: Index<AbcMultiname>,
+        mc: MutationContext<'gc, '_>,
+    ) -> Result<Gc<'gc, Multiname<'gc>>, Error<'gc>> {
+        let multiname = self.pool_maybe_uninitialized_multiname(multiname_index, mc)?;
+        if multiname.has_lazy_component() {
+            return Err(format!("Multiname {} is not static", multiname_index.0).into());
+        }
+
+        Ok(multiname)
+    }
+
+    /// Retrieve a static, or non-runtime, multiname from the current constant
+    /// pool.
+    ///
+    /// This version of the function treats index 0 as the any-type `*`.
+    pub fn pool_multiname_static_any(
+        self,
+        multiname_index: Index<AbcMultiname>,
+        mc: MutationContext<'gc, '_>,
+    ) -> Result<Gc<'gc, Multiname<'gc>>, Error<'gc>> {
+        if multiname_index.0 == 0 {
+            Ok(Gc::allocate(mc, Multiname::any()))
+        } else {
+            self.pool_multiname_static(multiname_index, mc)
+        }
     }
 }
 
@@ -286,9 +403,9 @@ impl<'gc> Script<'gc> {
         globals: Object<'gc>,
         domain: Domain<'gc>,
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, Error<'gc>> {
         let abc = unit.abc();
-        let script: Result<&AbcScript, Error> = abc
+        let script: Result<&AbcScript, Error<'gc>> = abc
             .scripts
             .get(script_index as usize)
             .ok_or_else(|| "LoadError: Script index not valid".into());
@@ -320,7 +437,7 @@ impl<'gc> Script<'gc> {
         unit: TranslationUnit<'gc>,
         script_index: u32,
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), Error<'gc>> {
         let mut write = self.0.write(activation.context.gc_context);
 
         if write.traits_loaded {
@@ -330,7 +447,7 @@ impl<'gc> Script<'gc> {
         write.traits_loaded = true;
 
         let abc = unit.abc();
-        let script: Result<_, Error> = abc
+        let script: Result<_, Error<'gc>> = abc
             .scripts
             .get(script_index as usize)
             .ok_or_else(|| "LoadError: Script index not valid".into());
@@ -338,7 +455,13 @@ impl<'gc> Script<'gc> {
 
         for abc_trait in script.traits.iter() {
             let newtrait = Trait::from_abc_trait(unit, abc_trait, activation)?;
-            if !newtrait.name().namespace().is_private() {
+            let name = newtrait.name();
+            if name.namespace().is_private() {
+                unit.0
+                    .write(activation.context.gc_context)
+                    .private_trait_scripts
+                    .insert(name, *self);
+            } else {
                 write.domain.export_definition(
                     newtrait.name(),
                     *self,
@@ -364,7 +487,7 @@ impl<'gc> Script<'gc> {
     pub fn globals(
         &mut self,
         context: &mut UpdateContext<'_, 'gc, '_>,
-    ) -> Result<Object<'gc>, Error> {
+    ) -> Result<Object<'gc>, Error<'gc>> {
         let mut write = self.0.write(context.gc_context);
 
         if !write.initialized {
@@ -379,7 +502,7 @@ impl<'gc> Script<'gc> {
             let scope = ScopeChain::new(domain);
 
             globals.vtable().unwrap().init_vtable(
-                None,
+                globals.instance_of().unwrap(),
                 &self.traits()?,
                 scope,
                 None,
@@ -399,7 +522,7 @@ impl<'gc> Script<'gc> {
     ///
     /// This function will return an error if it is incorrectly called before
     /// traits are loaded.
-    pub fn traits<'a>(&'a self) -> Result<Ref<'a, [Trait<'gc>]>, Error> {
+    pub fn traits<'a>(&'a self) -> Result<Ref<'a, [Trait<'gc>]>, Error<'gc>> {
         let read = self.0.read();
 
         if !read.traits_loaded {

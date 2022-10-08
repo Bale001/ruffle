@@ -1,16 +1,16 @@
 //! ActionScript Virtual Machine 2 (AS3) support
 
-use crate::avm2::globals::{SystemClasses, SystemPrototypes};
-use crate::avm2::method::Method;
-use crate::avm2::object::EventObject;
+use crate::avm2::class::AllocatorFn;
+use crate::avm2::function::Executable;
+use crate::avm2::globals::SystemClasses;
+use crate::avm2::method::{Method, NativeMethodImpl};
 use crate::avm2::script::{Script, TranslationUnit};
 use crate::context::UpdateContext;
 use crate::string::AvmString;
-use crate::tag_utils::SwfSlice;
 use fnv::FnvHashMap;
-use gc_arena::{Collect, MutationContext};
-use std::rc::Rc;
+use gc_arena::{Collect, GcCell, MutationContext};
 use swf::avm2::read::Reader;
+use swf::{DoAbc, DoAbcFlag};
 
 #[macro_export]
 macro_rules! avm_debug {
@@ -21,19 +21,24 @@ macro_rules! avm_debug {
     )
 }
 
-mod activation;
+pub mod activation;
+mod amf;
 mod array;
-mod bytearray;
+pub mod bytearray;
+mod call_stack;
 mod class;
 mod domain;
+pub mod error;
 mod events;
 mod function;
-mod globals;
+pub mod globals;
 mod method;
-mod names;
-mod object;
+mod multiname;
+mod namespace;
+pub mod object;
 mod property;
 mod property_map;
+mod qname;
 mod regexp;
 mod scope;
 mod script;
@@ -45,21 +50,19 @@ mod vtable;
 
 pub use crate::avm2::activation::Activation;
 pub use crate::avm2::array::ArrayStorage;
+pub use crate::avm2::call_stack::{CallNode, CallStack};
 pub use crate::avm2::domain::Domain;
-pub use crate::avm2::events::Event;
-pub use crate::avm2::names::{Namespace, QName};
+pub use crate::avm2::error::Error;
+pub use crate::avm2::multiname::Multiname;
+pub use crate::avm2::namespace::Namespace;
 pub use crate::avm2::object::{
-    ArrayObject, ClassObject, Object, ScriptObject, SoundChannelObject, StageObject, TObject,
+    ArrayObject, ClassObject, EventObject, Object, ScriptObject, SoundChannelObject, StageObject,
+    TObject,
 };
+pub use crate::avm2::qname::QName;
 pub use crate::avm2::value::Value;
 
 const BROADCAST_WHITELIST: [&str; 3] = ["enterFrame", "exitFrame", "frameConstructed"];
-
-/// Boxed error alias.
-///
-/// As AVM2 is a far stricter VM than AVM1, this may eventually be replaced
-/// with a proper Avm2Error enum.
-pub type Error = Box<dyn std::error::Error>;
 
 /// The state of an AVM2 interpreter.
 #[derive(Collect)]
@@ -68,14 +71,20 @@ pub struct Avm2<'gc> {
     /// Values currently present on the operand stack.
     stack: Vec<Value<'gc>>,
 
+    /// The current call stack of the player.
+    call_stack: GcCell<'gc, CallStack<'gc>>,
+
     /// Global scope object.
     globals: Domain<'gc>,
 
-    /// System prototypes.
-    system_prototypes: Option<SystemPrototypes<'gc>>,
-
     /// System classes.
     system_classes: Option<SystemClasses<'gc>>,
+
+    #[collect(require_static)]
+    native_method_table: &'static [Option<(&'static str, NativeMethodImpl)>],
+
+    #[collect(require_static)]
+    native_instance_allocator_table: &'static [Option<(&'static str, AllocatorFn)>],
 
     /// A list of objects which are capable of recieving broadcasts.
     ///
@@ -98,9 +107,11 @@ impl<'gc> Avm2<'gc> {
 
         Self {
             stack: Vec::new(),
+            call_stack: GcCell::allocate(mc, CallStack::new()),
             globals,
-            system_prototypes: None,
             system_classes: None,
+            native_method_table: Default::default(),
+            native_instance_allocator_table: Default::default(),
             broadcast_list: Default::default(),
 
             #[cfg(feature = "avm_debug")]
@@ -108,17 +119,10 @@ impl<'gc> Avm2<'gc> {
         }
     }
 
-    pub fn load_player_globals(context: &mut UpdateContext<'_, 'gc, '_>) -> Result<(), Error> {
+    pub fn load_player_globals(context: &mut UpdateContext<'_, 'gc, '_>) -> Result<(), Error<'gc>> {
         let globals = context.avm2.globals;
         let mut activation = Activation::from_nothing(context.reborrow());
         globals::load_player_globals(&mut activation, globals)
-    }
-
-    /// Return the current set of system prototypes.
-    ///
-    /// This function panics if the interpreter has not yet been initialized.
-    pub fn prototypes(&self) -> &SystemPrototypes<'gc> {
-        self.system_prototypes.as_ref().unwrap()
     }
 
     /// Return the current set of system classes.
@@ -132,7 +136,7 @@ impl<'gc> Avm2<'gc> {
     pub fn run_script_initializer(
         script: Script<'gc>,
         context: &mut UpdateContext<'_, 'gc, '_>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), Error<'gc>> {
         let mut init_activation = Activation::from_script(context.reborrow(), script)?;
 
         let (method, scope, _domain) = script.init();
@@ -140,12 +144,29 @@ impl<'gc> Avm2<'gc> {
             Method::Native(method) => {
                 //This exists purely to check if the builtin is OK with being called with
                 //no parameters.
-                init_activation.resolve_parameters(method.name, &[], &method.signature)?;
-
-                (method.method)(&mut init_activation, Some(scope), &[])?;
+                init_activation.resolve_parameters(&method.name, &[], &method.signature)?;
+                init_activation
+                    .context
+                    .avm2
+                    .push_global_init(init_activation.context.gc_context);
+                let r = (method.method)(&mut init_activation, Some(scope), &[]);
+                init_activation
+                    .context
+                    .avm2
+                    .pop_call(init_activation.context.gc_context);
+                r?;
             }
-            Method::Bytecode(_) => {
-                init_activation.run_stack_frame_for_script(script)?;
+            Method::Bytecode(method) => {
+                init_activation
+                    .context
+                    .avm2
+                    .push_global_init(init_activation.context.gc_context);
+                let r = init_activation.run_actions(method);
+                init_activation
+                    .context
+                    .avm2
+                    .pop_call(init_activation.context.gc_context);
+                r?;
             }
         };
 
@@ -157,29 +178,12 @@ impl<'gc> Avm2<'gc> {
     /// The `bool` parameter reads true if the event was cancelled.
     pub fn dispatch_event(
         context: &mut UpdateContext<'_, 'gc, '_>,
-        event: Event<'gc>,
+        event: Object<'gc>,
         target: Object<'gc>,
-    ) -> Result<bool, Error> {
-        let event_constr = context.avm2.classes().event;
-        Self::dispatch_event_with_class(context, event, event_constr, target)
-    }
-
-    /// Dispatch an event on an object with a specific Event type.
-    ///
-    /// The `bool` parameter reads true if the event was cancelled.
-    pub fn dispatch_event_with_class(
-        context: &mut UpdateContext<'_, 'gc, '_>,
-        event: Event<'gc>,
-        event_class: ClassObject<'gc>,
-        target: Object<'gc>,
-    ) -> Result<bool, Error> {
+    ) -> Result<bool, Error<'gc>> {
         use crate::avm2::events::dispatch_event;
-
         let mut activation = Activation::from_nothing(context.reborrow());
-
-        let event_object = EventObject::from_event(&mut activation, event_class, event)?;
-
-        dispatch_event(&mut activation, target, event_object)
+        dispatch_event(&mut activation, target, event)
     }
 
     /// Add an object to the broadcast list.
@@ -223,10 +227,12 @@ impl<'gc> Avm2<'gc> {
     /// new broadcast type, you must add it to the `BROADCAST_WHITELIST` first.
     pub fn broadcast_event(
         context: &mut UpdateContext<'_, 'gc, '_>,
-        event: Event<'gc>,
+        event: Object<'gc>,
         on_type: ClassObject<'gc>,
-    ) -> Result<(), Error> {
-        let event_name = event.event_type();
+    ) -> Result<(), Error<'gc>> {
+        let base_event = event.as_event().unwrap(); // TODO: unwrap?
+        let event_name = base_event.event_type();
+        drop(base_event);
         if !BROADCAST_WHITELIST
             .iter()
             .any(|x| AvmString::from(*x) == event_name)
@@ -253,8 +259,8 @@ impl<'gc> Avm2<'gc> {
             if let Some(object) = object {
                 let mut activation = Activation::from_nothing(context.reborrow());
 
-                if object.is_of_type(on_type, &mut activation)? {
-                    Avm2::dispatch_event(&mut activation.context, event.clone(), object)?;
+                if object.is_of_type(on_type, &mut activation) {
+                    Avm2::dispatch_event(&mut activation.context, event, object)?;
                 }
             }
         }
@@ -267,41 +273,65 @@ impl<'gc> Avm2<'gc> {
         reciever: Option<Object<'gc>>,
         args: &[Value<'gc>],
         context: &mut UpdateContext<'_, 'gc, '_>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), Error<'gc>> {
         let mut evt_activation = Activation::from_nothing(context.reborrow());
         callable.call(reciever, args, &mut evt_activation)?;
 
         Ok(())
     }
 
-    /// Load an ABC file embedded in a `SwfSlice`.
-    ///
-    /// The `SwfSlice` must resolve to the contents of an ABC file.
-    pub fn load_abc(
-        abc: SwfSlice,
-        _abc_name: &str,
-        lazy_init: bool,
+    /// Load an ABC file embedded in a `DoAbc` tag.
+    pub fn do_abc(
         context: &mut UpdateContext<'_, 'gc, '_>,
+        do_abc: DoAbc,
         domain: Domain<'gc>,
-    ) -> Result<(), Error> {
-        let mut read = Reader::new(abc.as_ref());
+    ) -> Result<(), Error<'gc>> {
+        let mut reader = Reader::new(do_abc.data);
+        let abc = match reader.read() {
+            Ok(abc) => abc,
+            Err(_) => {
+                let mut activation = Activation::from_nothing(context.reborrow());
+                return Err(Error::AvmError(crate::avm2::error::verify_error(
+                    &mut activation,
+                    "Error #1107: The ABC data is corrupt, attempt to read out of bounds.",
+                    1107,
+                )?));
+            }
+        };
 
-        let abc_file = Rc::new(read.read()?);
-        let tunit = TranslationUnit::from_abc(abc_file.clone(), domain, context.gc_context);
-
-        for i in (0..abc_file.scripts.len()).rev() {
+        let num_scripts = abc.scripts.len();
+        let tunit = TranslationUnit::from_abc(abc, domain, context.gc_context);
+        for i in (0..num_scripts).rev() {
             let mut script = tunit.load_script(i as u32, context)?;
 
-            if !lazy_init {
+            if !do_abc.flags.contains(DoAbcFlag::LAZY_INITIALIZE) {
                 script.globals(context)?;
             }
         }
-
         Ok(())
     }
 
     pub fn global_domain(&self) -> Domain<'gc> {
         self.globals
+    }
+
+    /// Pushes an executable on the call stack
+    pub fn push_call(&self, mc: MutationContext<'gc, '_>, calling: Executable<'gc>) {
+        self.call_stack.write(mc).push(calling)
+    }
+
+    /// Pushes script initializer (global init) on the call stack
+    pub fn push_global_init(&self, mc: MutationContext<'gc, '_>) {
+        self.call_stack.write(mc).push_global_init()
+    }
+
+    /// Pops an executable off the call stack
+    pub fn pop_call(&self, mc: MutationContext<'gc, '_>) -> Option<CallNode<'gc>> {
+        self.call_stack.write(mc).pop()
+    }
+
+    pub fn call_stack(&self) -> GcCell<'gc, CallStack<'gc>> {
+        self.call_stack
     }
 
     /// Push a value onto the operand stack.
@@ -330,13 +360,28 @@ impl<'gc> Avm2<'gc> {
         value
     }
 
+    /// Peek the n-th value from the end of the operand stack.
+    #[allow(clippy::let_and_return)]
+    fn peek(&mut self, index: usize) -> Value<'gc> {
+        let value = self
+            .stack
+            .get(self.stack.len() - index - 1)
+            .copied()
+            .unwrap_or_else(|| {
+                log::warn!("Avm1::pop: Stack underflow");
+                Value::Undefined
+            });
+
+        avm_debug!(self, "Stack peek {}: {:?}", self.stack.len(), value);
+
+        value
+    }
+
     fn pop_args(&mut self, arg_count: u32) -> Vec<Value<'gc>> {
-        let mut args = Vec::with_capacity(arg_count as usize);
-        args.resize(arg_count as usize, Value::Undefined);
+        let mut args = vec![Value::Undefined; arg_count as usize];
         for arg in args.iter_mut().rev() {
             *arg = self.pop();
         }
-
         args
     }
 

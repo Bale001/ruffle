@@ -20,6 +20,11 @@ pub trait ReadSwfExt<'a> {
         *self.as_mut_slice() = &data[pos..];
     }
 
+    fn seek_absolute(&mut self, data: &'a [u8], pos: usize) {
+        let pos = pos.min(data.len());
+        *self.as_mut_slice() = &data[pos..];
+    }
+
     #[inline]
     fn read_u8(&mut self) -> Result<u8> {
         Ok(ReadBytesExt::read_u8(self.as_mut_slice())?)
@@ -107,8 +112,9 @@ pub trait ReadSwfExt<'a> {
     }
 
     #[inline]
-    fn read_str_with_len(&mut self, len: usize) -> Result<&'a SwfStr> {
-        let bytes = &self.read_slice(len)?;
+    fn read_str_with_len(&mut self) -> Result<&'a SwfStr> {
+        let len = self.read_u8()?;
+        let bytes = &self.read_slice(len.into())?;
         // TODO: Maybe just strip the possible trailing null char instead of looping here.
         Ok(SwfStr::from_bytes_null_terminated(bytes).unwrap_or_else(|| SwfStr::from_bytes(bytes)))
     }

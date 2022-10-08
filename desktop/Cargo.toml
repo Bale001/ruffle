@@ -1,26 +1,28 @@
 [package]
 name = "ruffle_desktop"
 version = "0.1.0"
-authors = ["Mike Welsh <mwelsh@gmail.com>"]
+authors = ["Ruffle LLC <ruffle@ruffle.rs>"]
 edition = "2021"
 default-run = "ruffle_desktop"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-clap = "3.0.0-rc.4"
-cpal = "0.13.4"
-ruffle_core = { path = "../core" }
+clap = { version = "4.0.9", features = ["derive"] }
+cpal = "0.14.0"
+ruffle_core = { path = "../core", features = ["audio", "symphonia", "nellymoser"] }
 ruffle_render_wgpu = { path = "../render/wgpu", features = ["clap"] }
-env_logger = { version = "0.9", default-features = false, features = ["humantime", "regex"] }
+ruffle_video_software = { path = "../video/software", optional = true }
+env_logger = { version = "0.9", default-features = false, features = ["humantime"] }
 generational-arena = "0.2.8"
 log = "0.4"
-winit = "0.26.0"
-webbrowser = "0.5.5"
-url = "2.2.2"
+winit = "0.26.1"
+webbrowser = "0.8.0"
+url = "2.3.1"
 clipboard = "0.5.0"
 dirs = "4.0"
-isahc = "1.6.0"
-tinyfiledialogs = "3.8.3"
+isahc = "1.7.2"
+rfd = "0.10.0"
+anyhow = "1.0"
 
 [target.'cfg(windows)'.dependencies]
 winapi = "0.3.9"
@@ -29,16 +31,16 @@ winapi = "0.3.9"
 embed-resource = "1"
 
 [features]
-default = ["h263", "vp6", "screenvideo"]
+default = ["software_video"]
 
 # core features
 avm_debug = ["ruffle_core/avm_debug"]
-h263 = ["ruffle_core/h263"]
 lzma = ["ruffle_core/lzma"]
-vp6 = ["ruffle_core/vp6"]
-screenvideo =  ["ruffle_core/screenvideo"]
+software_video = ["ruffle_video_software"]
 
 # wgpu features
 render_debug_labels = ["ruffle_render_wgpu/render_debug_labels"]
 render_trace = ["ruffle_render_wgpu/render_trace"]
 
+# sandboxing
+sandbox = []

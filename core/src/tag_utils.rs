@@ -1,12 +1,39 @@
-use crate::backend::navigator::url_from_relative_path;
-use crate::vminterface::AvmType;
 use gc_arena::Collect;
-use std::path::Path;
 use std::sync::Arc;
-use swf::{Fixed8, HeaderExt, Rectangle, TagCode, Twips};
+use swf::{CharacterId, Fixed8, HeaderExt, Rectangle, TagCode, Twips};
+use thiserror::Error;
 
-pub type Error = Box<dyn std::error::Error>;
-pub type DecodeResult = Result<(), Error>;
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error("Couldn't read SWF")]
+    InvalidSwf(#[from] swf::error::Error),
+
+    #[error("Couldn't register bitmap")]
+    InvalidBitmap(#[from] ruffle_render::error::Error),
+
+    #[error("Attempted to set symbol classes on movie without any")]
+    NoSymbolClasses,
+
+    #[error("Attempted to preload video frames into non-video character {0}")]
+    PreloadVideoIntoInvalidCharacter(CharacterId),
+
+    #[error("IO Error")]
+    IOError(#[from] std::io::Error),
+
+    #[error("Invalid SWF url")]
+    InvalidSwfUrl,
+}
+
+/// Whether or not to end tag decoding.
+pub enum ControlFlow {
+    /// Stop decoding after this tag.
+    Exit,
+
+    /// Continue decoding the next tag.
+    Continue,
+}
+
+pub type DecodeResult = Result<ControlFlow, Error>;
 pub type SwfStream<'a> = swf::read::Reader<'a>;
 
 /// An open, fully parsed SWF movie ready to play back, either in a Player or a
@@ -52,15 +79,17 @@ impl SwfMovie {
     }
 
     /// Utility method to construct a movie from a file on disk.
-    pub fn from_path<P: AsRef<Path>>(path: P, loader_url: Option<String>) -> Result<Self, Error> {
-        let mut url = path.as_ref().to_string_lossy().to_owned().to_string();
-        let cwd = std::env::current_dir()?;
-        if let Ok(abs_url) = url_from_relative_path(cwd, &url) {
-            url = abs_url.into();
-        }
+    #[cfg(any(unix, windows, target_os = "redox"))]
+    pub fn from_path<P: AsRef<std::path::Path>>(
+        path: P,
+        loader_url: Option<String>,
+    ) -> Result<Self, Error> {
+        let data = std::fs::read(&path)?;
 
-        let data = std::fs::read(path)?;
-        Self::from_data(&data, Some(url), loader_url)
+        let abs_path = path.as_ref().canonicalize()?;
+        let url = url::Url::from_file_path(abs_path).map_err(|()| Error::InvalidSwfUrl)?;
+
+        Self::from_data(&data, Some(url.into()), loader_url)
     }
 
     /// Construct a movie based on the contents of the SWF datastream.
@@ -140,15 +169,11 @@ impl SwfMovie {
         self.header.uncompressed_len()
     }
 
-    pub fn avm_type(&self) -> AvmType {
-        if self.header.is_action_script_3() {
-            AvmType::Avm2
-        } else {
-            AvmType::Avm1
-        }
+    pub fn is_action_script_3(&self) -> bool {
+        self.header.is_action_script_3()
     }
 
-    pub fn stage_size(&self) -> &Rectangle {
+    pub fn stage_size(&self) -> &Rectangle<Twips> {
         self.header.stage_size()
     }
 
@@ -206,22 +231,28 @@ impl SwfSlice {
         }
     }
 
+    /// Creates an empty SwfSlice of the same movie.
+    #[inline]
+    pub fn copy_empty(&self) -> Self {
+        Self::empty(self.movie.clone())
+    }
+
     /// Construct a new SwfSlice from a regular slice.
     ///
     /// This function returns None if the given slice is not a subslice of the
     /// current slice.
-    pub fn to_subslice(&self, slice: &[u8]) -> Option<Self> {
+    pub fn to_subslice(&self, slice: &[u8]) -> Self {
         let self_pval = self.movie.data().as_ptr() as usize;
         let slice_pval = slice.as_ptr() as usize;
 
         if (self_pval + self.start) <= slice_pval && slice_pval < (self_pval + self.end) {
-            Some(Self {
+            Self {
                 movie: self.movie.clone(),
                 start: slice_pval - self_pval,
                 end: (slice_pval - self_pval) + slice.len(),
-            })
+            }
         } else {
-            None
+            self.copy_empty()
         }
     }
 
@@ -229,19 +260,19 @@ impl SwfSlice {
     ///
     /// This function allows subslices outside the current slice to be formed,
     /// as long as they are valid subslices of the movie itself.
-    pub fn to_unbounded_subslice(&self, slice: &[u8]) -> Option<Self> {
+    pub fn to_unbounded_subslice(&self, slice: &[u8]) -> Self {
         let self_pval = self.movie.data().as_ptr() as usize;
         let self_len = self.movie.data().len();
         let slice_pval = slice.as_ptr() as usize;
 
         if self_pval <= slice_pval && slice_pval < (self_pval + self_len) {
-            Some(Self {
+            Self {
                 movie: self.movie.clone(),
                 start: slice_pval - self_pval,
                 end: (slice_pval - self_pval) + slice.len(),
-            })
+            }
         } else {
-            None
+            self.copy_empty()
         }
     }
 
@@ -254,8 +285,8 @@ impl SwfSlice {
     /// The returned slice may or may not be a subslice of the current slice.
     /// If the resulting slice would be outside the bounds of the underlying
     /// movie, or the given reader refers to a different underlying movie, this
-    /// function returns None.
-    pub fn resize_to_reader(&self, reader: &mut SwfStream<'_>, size: usize) -> Option<Self> {
+    /// function returns an empty slice.
+    pub fn resize_to_reader(&self, reader: &mut SwfStream<'_>, size: usize) -> Self {
         if self.movie.data().as_ptr() as usize <= reader.get_ref().as_ptr() as usize
             && (reader.get_ref().as_ptr() as usize)
                 < self.movie.data().as_ptr() as usize + self.movie.data().len()
@@ -268,33 +299,37 @@ impl SwfSlice {
             let len = self.movie.data().len();
 
             if new_start < len && new_end < len {
-                Some(Self {
+                Self {
                     movie: self.movie.clone(),
                     start: new_start,
                     end: new_end,
-                })
+                }
             } else {
-                None
+                self.copy_empty()
             }
         } else {
-            None
+            self.copy_empty()
         }
     }
 
     /// Construct a new SwfSlice from a start and an end.
     ///
     /// The start and end values will be relative to the current slice.
-    /// Furthermore, this function will yield None if the calculated slice
+    /// Furthermore, this function will yield an empty slice if the calculated slice
     /// would be invalid (e.g. negative length) or would extend past the end of
     /// the current slice.
-    pub fn to_start_and_end(&self, start: usize, end: usize) -> Option<Self> {
+    pub fn to_start_and_end(&self, start: usize, end: usize) -> Self {
         let new_start = self.start + start;
         let new_end = self.start + end;
 
         if new_start <= new_end {
-            self.to_subslice(self.movie.data().get(new_start..new_end)?)
+            if let Some(result) = self.movie.data().get(new_start..new_end) {
+                self.to_subslice(result)
+            } else {
+                self.copy_empty()
+            }
         } else {
-            None
+            self.copy_empty()
         }
     }
 
@@ -308,28 +343,53 @@ impl SwfSlice {
         self.movie.header().version()
     }
 
+    /// Checks if this slice is empty
+    pub fn is_empty(&self) -> bool {
+        self.end == self.start
+    }
+
     /// Construct a reader for this slice.
     ///
     /// The `from` parameter is the offset to start reading the slice from.
     pub fn read_from(&self, from: u64) -> swf::read::Reader<'_> {
         swf::read::Reader::new(&self.data()[from as usize..], self.movie.version())
     }
+
+    /// Get the length of the SwfSlice.
+    pub fn len(&self) -> usize {
+        self.end - self.start
+    }
 }
 
-pub fn decode_tags<'a, F>(
-    reader: &mut SwfStream<'a>,
-    mut tag_callback: F,
-    stop_tag: TagCode,
-) -> Result<(), Error>
+/// Decode tags from a SWF stream reader.
+///
+/// The given `tag_callback` will be called for each decoded tag. It will be
+/// provided with the stream to read from, the tag code read, and the tag's
+/// size. The callback is responsible for (optionally) parsing the contents of
+/// the tag; otherwise, it will be skipped.
+///
+/// Decoding will terminate when the following conditions occur:
+///
+///  * The `tag_callback` calls for the decoding to finish.
+///  * The decoder encounters a tag longer than the underlying SWF slice
+///    (indicated by returning false)
+///  * The SWF stream is otherwise corrupt or unreadable (indicated as an error
+///    result)
+///
+/// Decoding will also log tags longer than the SWF slice, error messages
+/// yielded from the tag callback, and unknown tags. It will *only* return an
+/// error message if the SWF tag itself could not be parsed. Other forms of
+/// irregular decoding will be signalled by returning false.
+pub fn decode_tags<'a, F>(reader: &mut SwfStream<'a>, mut tag_callback: F) -> Result<bool, Error>
 where
-    F: for<'b> FnMut(&'b mut SwfStream<'a>, TagCode, usize) -> DecodeResult,
+    F: for<'b> FnMut(&'b mut SwfStream<'a>, TagCode, usize) -> Result<ControlFlow, Error>,
 {
     loop {
         let (tag_code, tag_len) = reader.read_tag_code_and_length()?;
         if tag_len > reader.get_ref().len() {
             log::error!("Unexpected EOF when reading tag");
             *reader.get_mut() = &reader.get_ref()[reader.get_ref().len()..];
-            break;
+            return Ok(false);
         }
 
         let tag_slice = &reader.get_ref()[..tag_len];
@@ -338,13 +398,15 @@ where
             *reader.get_mut() = tag_slice;
             let result = tag_callback(reader, tag, tag_len);
 
-            if let Err(e) = result {
-                log::error!("Error running definition tag: {:?}, got {}", tag, e);
-            }
-
-            if stop_tag == tag {
-                *reader.get_mut() = end_slice;
-                break;
+            match result {
+                Err(e) => {
+                    log::error!("Error running definition tag: {:?}, got {}", tag, e)
+                }
+                Ok(ControlFlow::Exit) => {
+                    *reader.get_mut() = end_slice;
+                    break;
+                }
+                Ok(ControlFlow::Continue) => {}
             }
         } else {
             log::warn!("Unknown tag code: {:?}", tag_code);
@@ -353,5 +415,5 @@ where
         *reader.get_mut() = end_slice;
     }
 
-    Ok(())
+    Ok(true)
 }

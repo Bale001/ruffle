@@ -1,4 +1,4 @@
-//! flash.geom.Matrix
+//! flash.geom.Matrix object
 
 use crate::avm1::activation::Activation;
 use crate::avm1::error::Error;
@@ -6,9 +6,9 @@ use crate::avm1::function::{Executable, FunctionObject};
 use crate::avm1::globals::point::{point_to_object, value_to_point};
 use crate::avm1::property_decl::{define_properties_on, Declaration};
 use crate::avm1::{Object, ScriptObject, TObject, Value};
-use crate::matrix::Matrix;
 use crate::string::AvmString;
 use gc_arena::MutationContext;
+use ruffle_render::matrix::Matrix;
 use swf::Twips;
 
 const PROTO_DECLS: &[Declaration] = declare_properties! {
@@ -154,7 +154,7 @@ pub fn matrix_to_object<'gc>(
         matrix.tx.to_pixels().into(),
         matrix.ty.to_pixels().into(),
     ];
-    let constructor = activation.context.avm1.prototypes.matrix_constructor;
+    let constructor = activation.context.avm1.prototypes().matrix_constructor;
     let object = constructor.construct(activation, &args)?;
     Ok(object)
 }
@@ -226,7 +226,7 @@ fn clone<'gc>(
         this.get("tx", activation)?,
         this.get("ty", activation)?,
     ];
-    let constructor = activation.context.avm1.prototypes.matrix_constructor;
+    let constructor = activation.context.avm1.prototypes().matrix_constructor;
     let cloned = constructor.construct(activation, &args)?;
     Ok(cloned)
 }
@@ -477,7 +477,7 @@ pub fn create_proto<'gc>(
     proto: Object<'gc>,
     fn_proto: Object<'gc>,
 ) -> Object<'gc> {
-    let object = ScriptObject::object(gc_context, Some(proto));
+    let object = ScriptObject::new(gc_context, Some(proto));
     define_properties_on(PROTO_DECLS, gc_context, object, fn_proto);
     object.into()
 }

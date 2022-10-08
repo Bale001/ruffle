@@ -1,15 +1,16 @@
 //! Function prototype
 
+use crate::avm1::activation::Activation;
 use crate::avm1::error::Error;
 use crate::avm1::function::{ExecutionName, ExecutionReason};
 use crate::avm1::property_decl::{define_properties_on, Declaration};
-use crate::avm1::{activation::Activation, AvmString};
 use crate::avm1::{Object, ScriptObject, TObject, Value};
+use crate::string::AvmString;
 use gc_arena::MutationContext;
 
 const PROTO_DECLS: &[Declaration] = declare_properties! {
-    "call" => method(call);
-    "apply" => method(apply);
+    "call" => method(call; DONT_ENUM | DONT_DELETE);
+    "apply" => method(apply; DONT_ENUM | DONT_DELETE);
 };
 
 /// Implements `new Function()`
@@ -31,7 +32,7 @@ pub fn function<'gc>(
         Ok(arg.to_owned())
     } else {
         // Calling `Function()` seems to give a prototypeless bare object.
-        Ok(ScriptObject::object(activation.context.gc_context, None).into())
+        Ok(ScriptObject::new(activation.context.gc_context, None).into())
     }
 }
 
@@ -42,7 +43,7 @@ pub fn call<'gc>(
     myargs: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
     let this = match myargs.get(0).unwrap_or(&Value::Undefined) {
-        Value::Undefined | Value::Null => activation.context.avm1.globals,
+        Value::Undefined | Value::Null => activation.context.avm1.global_object_cell(),
         this_val => this_val.coerce_to_object(activation),
     };
     let empty = [];
@@ -56,7 +57,7 @@ pub fn call<'gc>(
         Some(exec) => exec.exec(
             ExecutionName::Static("[Anonymous]"),
             activation,
-            this,
+            this.into(),
             1,
             args,
             ExecutionReason::FunctionCall,
@@ -73,7 +74,7 @@ pub fn apply<'gc>(
     myargs: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
     let this = match myargs.get(0).unwrap_or(&Value::Undefined) {
-        Value::Undefined | Value::Null => activation.context.avm1.globals,
+        Value::Undefined | Value::Null => activation.context.avm1.global_object_cell(),
         this_val => this_val.coerce_to_object(activation),
     };
     let args_object = myargs.get(1).cloned().unwrap_or(Value::Undefined);
@@ -99,7 +100,7 @@ pub fn apply<'gc>(
         Some(exec) => exec.exec(
             ExecutionName::Static("[Anonymous]"),
             activation,
-            this,
+            this.into(),
             1,
             &child_args,
             ExecutionReason::FunctionCall,
@@ -117,8 +118,12 @@ pub fn apply<'gc>(
 /// returned object is also a bare object, which will need to be linked into
 /// the prototype of `Object`.
 pub fn create_proto<'gc>(gc_context: MutationContext<'gc, '_>, proto: Object<'gc>) -> Object<'gc> {
-    let function_proto = ScriptObject::object_cell(gc_context, Some(proto));
-    let object = function_proto.as_script_object().unwrap();
-    define_properties_on(PROTO_DECLS, gc_context, object, function_proto);
-    function_proto
+    let function_proto = ScriptObject::new(gc_context, Some(proto));
+    define_properties_on(
+        PROTO_DECLS,
+        gc_context,
+        function_proto,
+        function_proto.into(),
+    );
+    function_proto.into()
 }

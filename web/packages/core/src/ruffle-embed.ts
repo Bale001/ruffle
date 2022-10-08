@@ -1,14 +1,14 @@
 import {
-    FLASH_MIMETYPE,
-    FUTURESPLASH_MIMETYPE,
-    FLASH7_AND_8_MIMETYPE,
-    FLASH_MOVIE_MIMETYPE,
     isBuiltInContextMenuVisible,
     isFallbackElement,
     isScriptAccessAllowed,
     isSwfFilename,
+    isSwfMimeType,
+    isYoutubeFlashSource,
+    workaroundYoutubeMixedContent,
     RufflePlayer,
 } from "./ruffle-player";
+import { WindowMode } from "./load-options";
 import { registerElement } from "./register-element";
 
 /**
@@ -59,6 +59,9 @@ export class RuffleEmbed extends RufflePlayer {
                     this.attributes.getNamedItem("quality")?.value ?? "high",
                 scale:
                     this.attributes.getNamedItem("scale")?.value ?? "showAll",
+                wmode:
+                    (this.attributes.getNamedItem("wmode")
+                        ?.value as WindowMode) ?? WindowMode.Window,
             });
         }
     }
@@ -80,7 +83,7 @@ export class RuffleEmbed extends RufflePlayer {
      * @internal
      */
     set src(srcval: string | undefined) {
-        if (srcval != undefined) {
+        if (srcval) {
             const attr = document.createAttribute("src");
             attr.value = srcval;
             this.attributes.setNamedItem(attr);
@@ -130,7 +133,7 @@ export class RuffleEmbed extends RufflePlayer {
      * @param elem Element to check.
      * @returns True if the element looks like a flash embed.
      */
-    static isInterdictable(elem: HTMLElement): boolean {
+    static isInterdictable(elem: Element): boolean {
         // Don't polyfill if the element is inside a specific node.
         if (isFallbackElement(elem)) {
             return false;
@@ -139,21 +142,21 @@ export class RuffleEmbed extends RufflePlayer {
         if (!elem.getAttribute("src")) {
             return false;
         }
-
-        // Check for MIME type.
-        const type = elem.getAttribute("type")?.toLowerCase();
-        if (
-            type === FLASH_MIMETYPE.toLowerCase() ||
-            type === FUTURESPLASH_MIMETYPE.toLowerCase() ||
-            type === FLASH7_AND_8_MIMETYPE.toLowerCase() ||
-            type === FLASH_MOVIE_MIMETYPE.toLowerCase()
-        ) {
-            return true;
-        } else if (type == null || type === "") {
-            return isSwfFilename(elem.getAttribute("src"));
+        // Don't polyfill when the file is a Youtube Flash source.
+        if (isYoutubeFlashSource(elem.getAttribute("src"))) {
+            // Workaround YouTube mixed content; this isn't what browsers do automatically, but while we're here, we may as well
+            workaroundYoutubeMixedContent(elem, "src");
+            return false;
         }
 
-        return false;
+        // Check for MIME type.
+        const type = elem.getAttribute("type");
+        if (!type) {
+            // If no MIME type is specified, polyfill if movie is an SWF file.
+            return isSwfFilename(elem.getAttribute("src"));
+        } else {
+            return isSwfMimeType(type);
+        }
     }
 
     /**
@@ -162,7 +165,7 @@ export class RuffleEmbed extends RufflePlayer {
      * @param elem Element to replace.
      * @returns Created RuffleEmbed.
      */
-    static fromNativeEmbedElement(elem: HTMLElement): RuffleEmbed {
+    static fromNativeEmbedElement(elem: Element): RuffleEmbed {
         const externalName = registerElement("ruffle-embed", RuffleEmbed);
         const ruffleObj = <RuffleEmbed>document.createElement(externalName);
         ruffleObj.copyElement(elem);

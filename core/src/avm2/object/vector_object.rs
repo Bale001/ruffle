@@ -1,12 +1,12 @@
 //! Vector storage object
 
 use crate::avm2::activation::Activation;
-use crate::avm2::names::Multiname;
 use crate::avm2::object::script_object::ScriptObjectData;
 use crate::avm2::object::{ClassObject, Object, ObjectPtr, TObject};
 use crate::avm2::value::Value;
 use crate::avm2::vector::VectorStorage;
 use crate::avm2::Error;
+use crate::avm2::Multiname;
 use crate::string::AvmString;
 use gc_arena::{Collect, GcCell, MutationContext};
 use std::cell::{Ref, RefMut};
@@ -14,10 +14,9 @@ use std::cell::{Ref, RefMut};
 /// A class instance allocator that allocates Vector objects.
 pub fn vector_allocator<'gc>(
     class: ClassObject<'gc>,
-    proto: Object<'gc>,
     activation: &mut Activation<'_, 'gc, '_>,
-) -> Result<Object<'gc>, Error> {
-    let base = ScriptObjectData::base_new(Some(proto), Some(class));
+) -> Result<Object<'gc>, Error<'gc>> {
+    let base = ScriptObjectData::new(class);
 
     //Because allocators are still called to build prototypes, especially for
     //the unspecialized Vector class, we have to fall back to Object when
@@ -57,17 +56,16 @@ impl<'gc> VectorObject<'gc> {
     pub fn from_vector(
         vector: VectorStorage<'gc>,
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<Object<'gc>, Error> {
+    ) -> Result<Object<'gc>, Error<'gc>> {
         let value_type = vector.value_type();
         let vector_class = activation.avm2().classes().vector;
 
         let applied_class = vector_class.apply(activation, &[value_type.into()])?;
-        let applied_proto = applied_class.prototype();
 
         let mut object: Object<'gc> = VectorObject(GcCell::allocate(
             activation.context.gc_context,
             VectorObjectData {
-                base: ScriptObjectData::base_new(Some(applied_proto), Some(applied_class)),
+                base: ScriptObjectData::new(applied_class),
                 vector,
             },
         ))
@@ -96,13 +94,16 @@ impl<'gc> TObject<'gc> for VectorObject<'gc> {
         self,
         name: &Multiname<'gc>,
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<Value<'gc>, Error> {
+    ) -> Result<Value<'gc>, Error<'gc>> {
         let read = self.0.read();
 
         if name.contains_public_namespace() {
             if let Some(name) = name.local_name() {
                 if let Ok(index) = name.parse::<usize>() {
-                    return Ok(read.vector.get(index).unwrap_or(Value::Undefined));
+                    return Ok(read
+                        .vector
+                        .get(index, activation)
+                        .unwrap_or(Value::Undefined));
                 }
             }
         }
@@ -115,7 +116,7 @@ impl<'gc> TObject<'gc> for VectorObject<'gc> {
         name: &Multiname<'gc>,
         value: Value<'gc>,
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), Error<'gc>> {
         if name.contains_public_namespace() {
             if let Some(name) = name.local_name() {
                 if let Ok(index) = name.parse::<usize>() {
@@ -146,7 +147,7 @@ impl<'gc> TObject<'gc> for VectorObject<'gc> {
         name: &Multiname<'gc>,
         value: Value<'gc>,
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), Error<'gc>> {
         if name.contains_public_namespace() {
             if let Some(name) = name.local_name() {
                 if let Ok(index) = name.parse::<usize>() {
@@ -176,7 +177,7 @@ impl<'gc> TObject<'gc> for VectorObject<'gc> {
         self,
         activation: &mut Activation<'_, 'gc, '_>,
         name: &Multiname<'gc>,
-    ) -> Result<bool, Error> {
+    ) -> Result<bool, Error<'gc>> {
         if name.contains_public_namespace()
             && name.local_name().is_some()
             && name.local_name().unwrap().parse::<usize>().is_ok()
@@ -207,7 +208,7 @@ impl<'gc> TObject<'gc> for VectorObject<'gc> {
         self,
         last_index: u32,
         _activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<Option<u32>, Error> {
+    ) -> Result<Option<u32>, Error<'gc>> {
         if last_index < self.0.read().vector.length() as u32 {
             Ok(Some(last_index.saturating_add(1)))
         } else {
@@ -219,7 +220,7 @@ impl<'gc> TObject<'gc> for VectorObject<'gc> {
         self,
         index: u32,
         _activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<Value<'gc>, Error> {
+    ) -> Result<Value<'gc>, Error<'gc>> {
         if self.0.read().vector.length() as u32 >= index {
             Ok(index
                 .checked_sub(1)
@@ -236,29 +237,15 @@ impl<'gc> TObject<'gc> for VectorObject<'gc> {
             .unwrap_or(false)
     }
 
-    fn to_string(&self, _mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error> {
+    fn to_string(
+        &self,
+        _activation: &mut Activation<'_, 'gc, '_>,
+    ) -> Result<Value<'gc>, Error<'gc>> {
         Ok(Value::Object(Object::from(*self)))
     }
 
-    fn value_of(&self, _mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error> {
+    fn value_of(&self, _mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error<'gc>> {
         Ok(Value::Object(Object::from(*self)))
-    }
-
-    fn derive(&self, activation: &mut Activation<'_, 'gc, '_>) -> Result<Object<'gc>, Error> {
-        let this: Object<'gc> = Object::VectorObject(*self);
-
-        //TODO: Pull the parameter out of the class object
-        let param_type = activation.avm2().classes().object;
-        let base = ScriptObjectData::base_new(Some(this), None);
-
-        Ok(VectorObject(GcCell::allocate(
-            activation.context.gc_context,
-            VectorObjectData {
-                base,
-                vector: VectorStorage::new(0, false, param_type, activation),
-            },
-        ))
-        .into())
     }
 
     fn as_vector_storage(&self) -> Option<Ref<VectorStorage<'gc>>> {

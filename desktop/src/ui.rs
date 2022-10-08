@@ -1,7 +1,7 @@
 use clipboard::{ClipboardContext, ClipboardProvider};
-use ruffle_core::backend::ui::{Error, MouseCursor, UiBackend};
+use rfd::{MessageButtons, MessageDialog, MessageLevel};
+use ruffle_core::backend::ui::{FullscreenError, MouseCursor, UiBackend};
 use std::rc::Rc;
-use tinyfiledialogs::{message_box_ok, MessageBoxIcon};
 use winit::window::{Fullscreen, Window};
 
 pub struct DesktopUiBackend {
@@ -22,7 +22,8 @@ impl DesktopUiBackend {
 
 // TODO: Move link to https://ruffle.rs/faq or similar
 const UNSUPPORTED_CONTENT_MESSAGE: &str = "\
-This content is not yet supported by Ruffle and will likely not run as intended.
+The Ruffle emulator does not yet support ActionScript 3, required by this content.
+If you choose to run it anyway, interactivity will be missing or limited.
 
 See the following link for more info:
 https://github.com/ruffle-rs/ruffle/wiki/Frequently-Asked-Questions-For-Users";
@@ -54,7 +55,7 @@ impl UiBackend for DesktopUiBackend {
         self.clipboard.set_contents(content).unwrap();
     }
 
-    fn set_fullscreen(&mut self, is_full: bool) -> Result<(), Error> {
+    fn set_fullscreen(&mut self, is_full: bool) -> Result<(), FullscreenError> {
         self.window.set_fullscreen(if is_full {
             Some(Fullscreen::Borderless(None))
         } else {
@@ -64,22 +65,29 @@ impl UiBackend for DesktopUiBackend {
     }
 
     fn display_unsupported_message(&self) {
-        message_box_ok(
-            "Ruffle - Unsupported content",
-            UNSUPPORTED_CONTENT_MESSAGE,
-            MessageBoxIcon::Warning,
-        );
+        let dialog = MessageDialog::new()
+            .set_level(MessageLevel::Warning)
+            .set_title("Ruffle - Unsupported content")
+            .set_description(UNSUPPORTED_CONTENT_MESSAGE)
+            .set_buttons(MessageButtons::Ok);
+        dialog.show();
     }
 
     fn display_root_movie_download_failed_message(&self) {
-        message_box_ok(
-            "Ruffle - Load failed",
-            DOWNLOAD_FAILED_MESSAGE,
-            MessageBoxIcon::Warning,
-        );
+        let dialog = MessageDialog::new()
+            .set_level(MessageLevel::Warning)
+            .set_title("Ruffle - Load failed")
+            .set_description(DOWNLOAD_FAILED_MESSAGE)
+            .set_buttons(MessageButtons::Ok);
+        dialog.show();
     }
 
     fn message(&self, message: &str) {
-        message_box_ok("Ruffle", message, MessageBoxIcon::Info)
+        let dialog = MessageDialog::new()
+            .set_level(MessageLevel::Info)
+            .set_title("Ruffle")
+            .set_description(message)
+            .set_buttons(MessageButtons::Ok);
+        dialog.show();
     }
 }

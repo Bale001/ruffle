@@ -133,7 +133,7 @@ pub fn get_language<'gc>(
             .context
             .system
             .language
-            .get_language_code(activation.context.avm1.player_version),
+            .get_language_code(activation.context.avm1.player_version()),
     )
     .into())
 }
@@ -181,7 +181,7 @@ pub fn get_manufacturer<'gc>(
             .context
             .system
             .manufacturer
-            .get_manufacturer_string(activation.context.avm1.player_version),
+            .get_manufacturer_string(activation.context.avm1.player_version()),
     )
     .into())
 }
@@ -254,7 +254,7 @@ pub fn create<'gc>(
     proto: Option<Object<'gc>>,
     fn_proto: Object<'gc>,
 ) -> Object<'gc> {
-    let capabilities = ScriptObject::object(gc_context, proto);
+    let capabilities = ScriptObject::new(gc_context, proto);
     define_properties_on(OBJECT_DECLS, gc_context, capabilities, fn_proto);
     capabilities.into()
 }

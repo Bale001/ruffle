@@ -4,10 +4,12 @@ use crate::avm2::activation::Activation;
 use crate::avm2::class::Class;
 use crate::avm2::globals::array::resolve_array_hole;
 use crate::avm2::method::{Method, NativeMethodImpl};
-use crate::avm2::names::{Multiname, Namespace, QName};
-use crate::avm2::object::{FunctionObject, Object, TObject};
+use crate::avm2::object::{function_allocator, FunctionObject, Object, TObject};
 use crate::avm2::value::Value;
 use crate::avm2::Error;
+use crate::avm2::Multiname;
+use crate::avm2::Namespace;
+use crate::avm2::QName;
 use gc_arena::{GcCell, MutationContext};
 
 /// Implements `Function`'s instance initializer.
@@ -15,7 +17,7 @@ pub fn instance_init<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     _args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(this) = this {
         activation.super_init(this, &[])?;
     }
@@ -28,7 +30,7 @@ pub fn class_init<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     _args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(this) = this {
         let scope = activation.create_scopechain();
         let this_class = this.as_class_object().unwrap();
@@ -62,12 +64,12 @@ pub fn class_init<'gc>(
             activation.context.gc_context,
             "call".into(),
             false,
-        )?;
+        );
         function_proto.set_local_property_is_enumerable(
             activation.context.gc_context,
             "apply".into(),
             false,
-        )?;
+        );
     }
     Ok(Value::Undefined)
 }
@@ -77,7 +79,7 @@ fn call<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     func: Option<Object<'gc>>,
     args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     let this = args
         .get(0)
         .and_then(|v| v.coerce_to_object(activation).ok())
@@ -99,19 +101,15 @@ fn apply<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     func: Option<Object<'gc>>,
     args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     let this = args
         .get(0)
         .and_then(|v| v.coerce_to_object(activation).ok())
         .or_else(|| activation.global_scope());
 
     if let Some(func) = func {
-        let arg_array = args
-            .get(1)
-            .cloned()
-            .unwrap_or(Value::Undefined)
-            .coerce_to_object(activation);
-        let resolved_args = if let Ok(arg_array) = arg_array {
+        let arg_array = args.get(1).cloned().unwrap_or(Value::Undefined).as_object();
+        let resolved_args = if let Some(arg_array) = arg_array {
             let arg_storage: Vec<Option<Value<'gc>>> = arg_array
                 .as_array_storage()
                 .map(|a| a.iter().collect())
@@ -135,11 +133,23 @@ fn apply<'gc>(
     }
 }
 
+fn length<'gc>(
+    _activation: &mut Activation<'_, 'gc, '_>,
+    this: Option<Object<'gc>>,
+    _args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    if let Some(this) = this.and_then(|this| this.as_function_object()) {
+        return Ok(this.num_parameters().into());
+    }
+
+    Ok(Value::Undefined)
+}
+
 fn prototype<'gc>(
     _activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     _args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(this) = this {
         if let Some(function) = this.as_function_object() {
             if let Some(proto) = function.prototype() {
@@ -156,13 +166,14 @@ fn set_prototype<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     args: &[Value<'gc>],
-) -> Result<Value<'gc>, Error> {
+) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(this) = this {
         if let Some(function) = this.as_function_object() {
             let new_proto = args
                 .get(0)
                 .unwrap_or(&Value::Undefined)
-                .coerce_to_object(activation)?;
+                .as_object()
+                .ok_or("Cannot set prototype of class to null or undefined")?;
             function.set_prototype(new_proto, activation.context.gc_context);
         }
     }
@@ -173,7 +184,7 @@ fn set_prototype<'gc>(
 pub fn create_class<'gc>(gc_context: MutationContext<'gc, '_>) -> GcCell<'gc, Class<'gc>> {
     let function_class = Class::new(
         QName::new(Namespace::public(), "Function"),
-        Some(QName::new(Namespace::public(), "Object").into()),
+        Some(Multiname::public("Object")),
         Method::from_builtin(instance_init, "<Function instance initializer>", gc_context),
         Method::from_builtin(class_init, "<Function class initializer>", gc_context),
         gc_context,
@@ -189,8 +200,13 @@ pub fn create_class<'gc>(gc_context: MutationContext<'gc, '_>) -> GcCell<'gc, Cl
         &str,
         Option<NativeMethodImpl>,
         Option<NativeMethodImpl>,
-    )] = &[("prototype", Some(prototype), Some(set_prototype))];
+    )] = &[
+        ("prototype", Some(prototype), Some(set_prototype)),
+        ("length", Some(length), None),
+    ];
     write.define_public_builtin_instance_properties(gc_context, PUBLIC_INSTANCE_PROPERTIES);
+
+    write.set_instance_allocator(function_allocator);
 
     function_class
 }

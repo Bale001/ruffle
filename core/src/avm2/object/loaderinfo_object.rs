@@ -4,9 +4,11 @@ use crate::avm2::activation::Activation;
 use crate::avm2::object::script_object::ScriptObjectData;
 use crate::avm2::object::{ClassObject, Object, ObjectPtr, TObject};
 use crate::avm2::value::Value;
+use crate::avm2::Avm2;
 use crate::avm2::Error;
-use crate::display_object::DisplayObject;
-use crate::string::AvmString;
+use crate::avm2::EventObject;
+use crate::context::UpdateContext;
+use crate::display_object::{DisplayObject, TDisplayObject};
 use crate::tag_utils::SwfMovie;
 use gc_arena::{Collect, GcCell, MutationContext};
 use std::cell::{Ref, RefMut};
@@ -15,16 +17,24 @@ use std::sync::Arc;
 /// A class instance allocator that allocates LoaderInfo objects.
 pub fn loaderinfo_allocator<'gc>(
     class: ClassObject<'gc>,
-    proto: Object<'gc>,
     activation: &mut Activation<'_, 'gc, '_>,
-) -> Result<Object<'gc>, Error> {
-    let base = ScriptObjectData::base_new(Some(proto), Some(class));
+) -> Result<Object<'gc>, Error<'gc>> {
+    let base = ScriptObjectData::new(class);
 
     Ok(LoaderInfoObject(GcCell::allocate(
         activation.context.gc_context,
         LoaderInfoObjectData {
             base,
             loaded_stream: None,
+            loader: None,
+            init_event_fired: false,
+            complete_event_fired: false,
+            shared_events: activation
+                .context
+                .avm2
+                .classes()
+                .eventdispatcher
+                .construct(activation, &[])?,
         },
     ))
     .into())
@@ -34,12 +44,21 @@ pub fn loaderinfo_allocator<'gc>(
 #[derive(Collect, Debug, Clone)]
 #[collect(no_drop)]
 pub enum LoaderStream<'gc> {
-    /// The current stage.
+    /// An SWF movie that has not yet loaded.
     ///
-    /// While it makes no sense to actually retrieve loader info properties off
-    /// the stage, it's possible to do so. Some properties yield the
-    /// not-yet-loaded error while others are pulled from the root SWF.
-    Stage,
+    /// The main differences from `Swf` loader streams is that certain loader
+    /// info properties are `null` until the SWF is fully loaded. Furthermore,
+    /// the `DisplayObject` parameter is optional, to represent movies that do
+    /// not yet have a root clip.
+    ///
+    /// While the `Stage` is not a loadable object, it has `loaderInfo`, with
+    /// properties that roughly mirror an unloaded movie clip. Properties that
+    /// are valid on `Stage.loaderInfo` will be pulled from the root SWF.
+    ///
+    /// The `bool` parameter indicates if this is the `Stage`'s loader info;
+    /// this is because certain `Stage` properties are accessible even when the
+    /// associated movie is not yet loaded.
+    NotYetLoaded(Arc<SwfMovie>, Option<DisplayObject<'gc>>, bool),
 
     /// A loaded SWF movie.
     ///
@@ -61,6 +80,19 @@ pub struct LoaderInfoObjectData<'gc> {
 
     /// The loaded stream that this gets it's info from.
     loaded_stream: Option<LoaderStream<'gc>>,
+
+    loader: Option<Object<'gc>>,
+
+    /// Whether or not we've fired our 'init' event
+    init_event_fired: bool,
+
+    /// Whether or not we've fired our 'complete' event
+    complete_event_fired: bool,
+
+    /// The `EventDispatcher` used for `LoaderInfo.sharedEvents`.
+    // FIXME: If we ever implement sandboxing, then ensure that we allow
+    // events to be fired across security boundaries using this object.
+    shared_events: Object<'gc>,
 }
 
 impl<'gc> LoaderInfoObject<'gc> {
@@ -69,10 +101,10 @@ impl<'gc> LoaderInfoObject<'gc> {
         activation: &mut Activation<'_, 'gc, '_>,
         movie: Arc<SwfMovie>,
         root: DisplayObject<'gc>,
-    ) -> Result<Object<'gc>, Error> {
+        loader: Option<Object<'gc>>,
+    ) -> Result<Object<'gc>, Error<'gc>> {
         let class = activation.avm2().classes().loaderinfo;
-        let proto = activation.avm2().prototypes().loaderinfo;
-        let base = ScriptObjectData::base_new(Some(proto), Some(class));
+        let base = ScriptObjectData::new(class);
         let loaded_stream = Some(LoaderStream::Swf(movie, root));
 
         let mut this: Object<'gc> = LoaderInfoObject(GcCell::allocate(
@@ -80,6 +112,15 @@ impl<'gc> LoaderInfoObject<'gc> {
             LoaderInfoObjectData {
                 base,
                 loaded_stream,
+                loader,
+                init_event_fired: false,
+                complete_event_fired: false,
+                shared_events: activation
+                    .context
+                    .avm2
+                    .classes()
+                    .eventdispatcher
+                    .construct(activation, &[])?,
             },
         ))
         .into();
@@ -90,17 +131,34 @@ impl<'gc> LoaderInfoObject<'gc> {
         Ok(this)
     }
 
-    /// Create a loader info object for the stage.
-    pub fn from_stage(activation: &mut Activation<'_, 'gc, '_>) -> Result<Object<'gc>, Error> {
+    /// Create a loader info object that has not yet been loaded.
+    ///
+    /// Use `None` as the root clip to indicate that this is the stage's loader
+    /// info.
+    pub fn not_yet_loaded(
+        activation: &mut Activation<'_, 'gc, '_>,
+        movie: Arc<SwfMovie>,
+        loader: Option<Object<'gc>>,
+        root_clip: Option<DisplayObject<'gc>>,
+        is_stage: bool,
+    ) -> Result<Object<'gc>, Error<'gc>> {
         let class = activation.avm2().classes().loaderinfo;
-        let proto = activation.avm2().prototypes().loaderinfo;
-        let base = ScriptObjectData::base_new(Some(proto), Some(class));
+        let base = ScriptObjectData::new(class);
 
         let mut this: Object<'gc> = LoaderInfoObject(GcCell::allocate(
             activation.context.gc_context,
             LoaderInfoObjectData {
                 base,
-                loaded_stream: Some(LoaderStream::Stage),
+                loaded_stream: Some(LoaderStream::NotYetLoaded(movie, root_clip, is_stage)),
+                loader,
+                init_event_fired: false,
+                complete_event_fired: false,
+                shared_events: activation
+                    .context
+                    .avm2
+                    .classes()
+                    .eventdispatcher
+                    .construct(activation, &[])?,
             },
         ))
         .into();
@@ -109,6 +167,70 @@ impl<'gc> LoaderInfoObject<'gc> {
         class.call_native_init(Some(this), &[], activation)?;
 
         Ok(this)
+    }
+
+    pub fn loader(&self) -> Option<Object<'gc>> {
+        return self.0.read().loader;
+    }
+
+    pub fn shared_events(&self) -> Object<'gc> {
+        return self.0.read().shared_events;
+    }
+
+    pub fn fire_init_and_complete_events(&self, context: &mut UpdateContext<'_, 'gc, '_>) {
+        if !self.0.read().init_event_fired {
+            self.0.write(context.gc_context).init_event_fired = true;
+
+            // TODO - 'init' should be fired earlier during the download.
+            // Right now, we fire it when downloading is fully completed.
+            let init_evt = EventObject::bare_default_event(context, "init");
+
+            if let Err(e) = Avm2::dispatch_event(context, init_evt, (*self).into()) {
+                log::error!(
+                    "Encountered AVM2 error when broadcasting `init` event: {}",
+                    e
+                );
+            }
+        }
+
+        if !self.0.read().complete_event_fired {
+            // NOTE: We have to check load progress here because this function
+            // is called unconditionally at the end of every frame.
+            let should_complete = match self.0.read().loaded_stream {
+                Some(LoaderStream::Swf(_, root)) => root
+                    .as_movie_clip()
+                    .map(|mc| mc.loaded_bytes() >= mc.total_bytes())
+                    .unwrap_or(false),
+                _ => false,
+            };
+
+            if should_complete {
+                self.0.write(context.gc_context).complete_event_fired = true;
+                let complete_evt = EventObject::bare_default_event(context, "complete");
+
+                if let Err(e) = Avm2::dispatch_event(context, complete_evt, (*self).into()) {
+                    log::error!(
+                        "Encountered AVM2 error when broadcasting `complete` event: {}",
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    /// Unwrap this object's loader stream
+    pub fn as_loader_stream(&self) -> Option<Ref<LoaderStream<'gc>>> {
+        if self.0.read().loaded_stream.is_some() {
+            Some(Ref::map(self.0.read(), |v: &LoaderInfoObjectData<'gc>| {
+                v.loaded_stream.as_ref().unwrap()
+            }))
+        } else {
+            None
+        }
+    }
+
+    pub fn set_loader_stream(&self, stream: LoaderStream<'gc>, mc: MutationContext<'gc, '_>) {
+        self.0.write(mc).loaded_stream = Some(stream);
     }
 }
 
@@ -125,39 +247,11 @@ impl<'gc> TObject<'gc> for LoaderInfoObject<'gc> {
         self.0.as_ptr() as *const ObjectPtr
     }
 
-    fn value_of(&self, mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error> {
-        if let Some(class) = self.instance_of_class_definition() {
-            Ok(
-                AvmString::new_utf8(mc, format!("[object {}]", class.read().name().local_name()))
-                    .into(),
-            )
-        } else {
-            Ok("[object Object]".into())
-        }
+    fn value_of(&self, _mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error<'gc>> {
+        Ok(Value::Object((*self).into()))
     }
 
-    fn derive(&self, activation: &mut Activation<'_, 'gc, '_>) -> Result<Object<'gc>, Error> {
-        let this: Object<'gc> = Object::LoaderInfoObject(*self);
-        let base = ScriptObjectData::base_new(Some(this), None);
-
-        Ok(LoaderInfoObject(GcCell::allocate(
-            activation.context.gc_context,
-            LoaderInfoObjectData {
-                base,
-                loaded_stream: None,
-            },
-        ))
-        .into())
-    }
-
-    /// Unwrap this object's loader stream
-    fn as_loader_stream(&self) -> Option<Ref<LoaderStream<'gc>>> {
-        if self.0.read().loaded_stream.is_some() {
-            Some(Ref::map(self.0.read(), |v| {
-                v.loaded_stream.as_ref().unwrap()
-            }))
-        } else {
-            None
-        }
+    fn as_loader_info_object(&self) -> Option<&LoaderInfoObject<'gc>> {
+        Some(self)
     }
 }

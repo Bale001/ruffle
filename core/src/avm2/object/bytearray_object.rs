@@ -1,20 +1,19 @@
 use crate::avm2::activation::Activation;
 use crate::avm2::bytearray::ByteArrayStorage;
-use crate::avm2::names::Multiname;
 use crate::avm2::object::script_object::ScriptObjectData;
 use crate::avm2::object::{ClassObject, Object, ObjectPtr, TObject};
 use crate::avm2::value::Value;
 use crate::avm2::Error;
+use crate::avm2::Multiname;
 use gc_arena::{Collect, GcCell, MutationContext};
 use std::cell::{Ref, RefMut};
 
 /// A class instance allocator that allocates ByteArray objects.
-pub fn bytearray_allocator<'gc>(
+pub fn byte_array_allocator<'gc>(
     class: ClassObject<'gc>,
-    proto: Object<'gc>,
     activation: &mut Activation<'_, 'gc, '_>,
-) -> Result<Object<'gc>, Error> {
-    let base = ScriptObjectData::base_new(Some(proto), Some(class));
+) -> Result<Object<'gc>, Error<'gc>> {
+    let base = ScriptObjectData::new(class);
 
     Ok(ByteArrayObject(GcCell::allocate(
         activation.context.gc_context,
@@ -43,10 +42,9 @@ impl<'gc> ByteArrayObject<'gc> {
     pub fn from_storage(
         activation: &mut Activation<'_, 'gc, '_>,
         bytes: ByteArrayStorage,
-    ) -> Result<Object<'gc>, Error> {
+    ) -> Result<Object<'gc>, Error<'gc>> {
         let class = activation.avm2().classes().bytearray;
-        let proto = activation.avm2().prototypes().bytearray;
-        let base = ScriptObjectData::base_new(Some(proto), Some(class));
+        let base = ScriptObjectData::new(class);
 
         let mut instance: Object<'gc> = ByteArrayObject(GcCell::allocate(
             activation.context.gc_context,
@@ -81,14 +79,14 @@ impl<'gc> TObject<'gc> for ByteArrayObject<'gc> {
         self,
         name: &Multiname<'gc>,
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<Value<'gc>, Error> {
+    ) -> Result<Value<'gc>, Error<'gc>> {
         let read = self.0.read();
 
         if name.contains_public_namespace() {
             if let Some(name) = name.local_name() {
                 if let Ok(index) = name.parse::<usize>() {
                     return Ok(if let Some(val) = read.storage.get(index) {
-                        Value::Unsigned(val as u32)
+                        Value::Integer(val as i32)
                     } else {
                         Value::Undefined
                     });
@@ -104,7 +102,7 @@ impl<'gc> TObject<'gc> for ByteArrayObject<'gc> {
         name: &Multiname<'gc>,
         value: Value<'gc>,
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), Error<'gc>> {
         let mut write = self.0.write(activation.context.gc_context);
 
         if name.contains_public_namespace() {
@@ -127,7 +125,7 @@ impl<'gc> TObject<'gc> for ByteArrayObject<'gc> {
         name: &Multiname<'gc>,
         value: Value<'gc>,
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), Error<'gc>> {
         let mut write = self.0.write(activation.context.gc_context);
 
         if name.contains_public_namespace() {
@@ -149,7 +147,7 @@ impl<'gc> TObject<'gc> for ByteArrayObject<'gc> {
         self,
         activation: &mut Activation<'_, 'gc, '_>,
         name: &Multiname<'gc>,
-    ) -> Result<bool, Error> {
+    ) -> Result<bool, Error<'gc>> {
         if name.contains_public_namespace() {
             if let Some(name) = name.local_name() {
                 if let Ok(index) = name.parse::<usize>() {
@@ -181,20 +179,7 @@ impl<'gc> TObject<'gc> for ByteArrayObject<'gc> {
         self.0.read().base.has_own_property(name)
     }
 
-    fn derive(&self, activation: &mut Activation<'_, 'gc, '_>) -> Result<Object<'gc>, Error> {
-        let this: Object<'gc> = Object::ByteArrayObject(*self);
-        let base = ScriptObjectData::base_new(Some(this), None);
-
-        Ok(ByteArrayObject(GcCell::allocate(
-            activation.context.gc_context,
-            ByteArrayObjectData {
-                base,
-                storage: ByteArrayStorage::new(),
-            },
-        ))
-        .into())
-    }
-    fn value_of(&self, _mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error> {
+    fn value_of(&self, _mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error<'gc>> {
         Ok(Value::Object(Object::from(*self)))
     }
 

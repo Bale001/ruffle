@@ -12,10 +12,9 @@ use std::cell::{Ref, RefMut};
 /// A class instance allocator that allocates Sound objects.
 pub fn sound_allocator<'gc>(
     class: ClassObject<'gc>,
-    proto: Object<'gc>,
     activation: &mut Activation<'_, 'gc, '_>,
-) -> Result<Object<'gc>, Error> {
-    let base = ScriptObjectData::base_new(Some(proto), Some(class));
+) -> Result<Object<'gc>, Error<'gc>> {
+    let base = ScriptObjectData::new(class);
 
     Ok(SoundObject(GcCell::allocate(
         activation.context.gc_context,
@@ -49,9 +48,8 @@ impl<'gc> SoundObject<'gc> {
         activation: &mut Activation<'_, 'gc, '_>,
         class: ClassObject<'gc>,
         sound: SoundHandle,
-    ) -> Result<Object<'gc>, Error> {
-        let proto = class.prototype();
-        let base = ScriptObjectData::base_new(Some(proto), Some(class));
+    ) -> Result<Object<'gc>, Error<'gc>> {
+        let base = ScriptObjectData::new(class);
 
         let mut sound_object: Object<'gc> = SoundObject(GcCell::allocate(
             activation.context.gc_context,
@@ -82,18 +80,8 @@ impl<'gc> TObject<'gc> for SoundObject<'gc> {
         self.0.as_ptr() as *const ObjectPtr
     }
 
-    fn value_of(&self, _mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error> {
+    fn value_of(&self, _mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error<'gc>> {
         Ok(Object::from(*self).into())
-    }
-
-    fn derive(&self, activation: &mut Activation<'_, 'gc, '_>) -> Result<Object<'gc>, Error> {
-        let base = ScriptObjectData::base_new(Some((*self).into()), None);
-
-        Ok(SoundObject(GcCell::allocate(
-            activation.context.gc_context,
-            SoundObjectData { base, sound: None },
-        ))
-        .into())
     }
 
     fn as_sound(self) -> Option<SoundHandle> {

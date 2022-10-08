@@ -1,19 +1,12 @@
 //! Object trait to expose objects to AVM
 
-use crate::avm1::error::Error;
 use crate::avm1::function::{Executable, ExecutionName, ExecutionReason, FunctionObject};
-use crate::avm1::object::shared_object::SharedObject;
-use crate::avm1::object::super_object::SuperObject;
-use crate::avm1::object::value_object::ValueObject;
-use crate::avm1::property::Attribute;
-
-use crate::avm1::activation::Activation;
+use crate::avm1::globals::color_transform::ColorTransformObject;
 use crate::avm1::object::array_object::ArrayObject;
 use crate::avm1::object::bevel_filter::BevelFilterObject;
 use crate::avm1::object::bitmap_data::BitmapDataObject;
 use crate::avm1::object::blur_filter::BlurFilterObject;
 use crate::avm1::object::color_matrix_filter::ColorMatrixFilterObject;
-use crate::avm1::object::color_transform_object::ColorTransformObject;
 use crate::avm1::object::convolution_filter::ConvolutionFilterObject;
 use crate::avm1::object::date_object::DateObject;
 use crate::avm1::object::displacement_map_filter::DisplacementMapFilterObject;
@@ -21,15 +14,18 @@ use crate::avm1::object::drop_shadow_filter::DropShadowFilterObject;
 use crate::avm1::object::glow_filter::GlowFilterObject;
 use crate::avm1::object::gradient_bevel_filter::GradientBevelFilterObject;
 use crate::avm1::object::gradient_glow_filter::GradientGlowFilterObject;
-use crate::avm1::object::text_format_object::TextFormatObject;
+use crate::avm1::object::shared_object::SharedObject;
+use crate::avm1::object::super_object::SuperObject;
 use crate::avm1::object::transform_object::TransformObject;
-use crate::avm1::object::xml_attributes_object::XmlAttributesObject;
-use crate::avm1::object::xml_idmap_object::XmlIdMapObject;
+use crate::avm1::object::value_object::ValueObject;
+use crate::avm1::object::xml_node_object::XmlNodeObject;
 use crate::avm1::object::xml_object::XmlObject;
-use crate::avm1::{AvmString, ScriptObject, SoundObject, StageObject, Value};
+use crate::avm1::{Activation, Attribute, Error, ScriptObject, SoundObject, StageObject, Value};
 use crate::display_object::DisplayObject;
+use crate::html::TextFormat;
+use crate::string::AvmString;
 use crate::xml::XmlNode;
-use gc_arena::{Collect, MutationContext};
+use gc_arena::{Collect, GcCell, MutationContext};
 use ruffle_macros::enum_trait_object;
 use std::fmt::Debug;
 
@@ -38,7 +34,6 @@ pub mod bevel_filter;
 pub mod bitmap_data;
 pub mod blur_filter;
 pub mod color_matrix_filter;
-pub mod color_transform_object;
 pub mod convolution_filter;
 mod custom_object;
 pub mod date_object;
@@ -52,12 +47,18 @@ pub mod shared_object;
 pub mod sound_object;
 pub mod stage_object;
 pub mod super_object;
-pub mod text_format_object;
 pub mod transform_object;
 pub mod value_object;
-pub mod xml_attributes_object;
-pub mod xml_idmap_object;
+pub mod xml_node_object;
 pub mod xml_object;
+
+#[derive(Clone, Collect)]
+#[collect(no_drop)]
+pub enum NativeObject<'gc> {
+    None,
+    ColorTransform(GcCell<'gc, ColorTransformObject>),
+    TextFormat(GcCell<'gc, TextFormat>),
+}
 
 /// Represents an object that can be directly interacted with by the AVM
 /// runtime.
@@ -72,12 +73,10 @@ pub mod xml_object;
         StageObject(StageObject<'gc>),
         SuperObject(SuperObject<'gc>),
         XmlObject(XmlObject<'gc>),
-        XmlAttributesObject(XmlAttributesObject<'gc>),
-        XmlIdMapObject(XmlIdMapObject<'gc>),
+        XmlNodeObject(XmlNodeObject<'gc>),
         ValueObject(ValueObject<'gc>),
         FunctionObject(FunctionObject<'gc>),
         SharedObject(SharedObject<'gc>),
-        ColorTransformObject(ColorTransformObject<'gc>),
         TransformObject(TransformObject<'gc>),
         BlurFilterObject(BlurFilterObject<'gc>),
         BevelFilterObject(BevelFilterObject<'gc>),
@@ -90,7 +89,6 @@ pub mod xml_object;
         GradientGlowFilterObject(GradientGlowFilterObject<'gc>),
         DateObject(DateObject<'gc>),
         BitmapData(BitmapDataObject<'gc>),
-        TextFormatObject(TextFormatObject<'gc>),
     }
 )]
 pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy {
@@ -187,7 +185,7 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
                             let _ = exec.exec(
                                 ExecutionName::Static("[Setter]"),
                                 activation,
-                                this,
+                                this.into(),
                                 1,
                                 &[value],
                                 ExecutionReason::Special,
@@ -215,7 +213,7 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         &self,
         name: AvmString<'gc>,
         activation: &mut Activation<'_, 'gc, '_>,
-        this: Object<'gc>,
+        this: Value<'gc>,
         args: &[Value<'gc>],
     ) -> Result<Value<'gc>, Error<'gc>>;
 
@@ -251,6 +249,7 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         name: AvmString<'gc>,
         args: &[Value<'gc>],
         activation: &mut Activation<'_, 'gc, '_>,
+        reason: ExecutionReason,
     ) -> Result<Value<'gc>, Error<'gc>> {
         let this = (*self).into();
         let (method, depth) = match search_prototype(Value::Object(this), name, activation, this)? {
@@ -266,13 +265,13 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
             Some(exec) => exec.exec(
                 ExecutionName::Dynamic(name),
                 activation,
-                this,
+                this.into(),
                 depth,
                 args,
-                ExecutionReason::FunctionCall,
+                reason,
                 method,
             ),
-            None => method.call(name, activation, this, args),
+            None => method.call(name, activation, this.into(), args),
         }
     }
 
@@ -442,9 +441,6 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
     /// Enumerate the object.
     fn get_keys(&self, activation: &mut Activation<'_, 'gc, '_>) -> Vec<AvmString<'gc>>;
 
-    /// Get the object's type string.
-    fn type_of(&self) -> &'static str;
-
     /// Enumerate all interfaces implemented by this object.
     fn interfaces(&self) -> Vec<Object<'gc>>;
 
@@ -498,6 +494,12 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         Ok(false)
     }
 
+    fn native(&self) -> NativeObject<'gc> {
+        NativeObject::None
+    }
+
+    fn set_native(&self, _gc_context: MutationContext<'gc, '_>, _native: NativeObject<'gc>) {}
+
     /// Get the underlying script object, if it exists.
     fn as_script_object(&self) -> Option<ScriptObject<'gc>>;
 
@@ -531,6 +533,11 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
         None
     }
 
+    /// Get the underlying XML document for this object, if it exists.
+    fn as_xml(&self) -> Option<XmlObject<'gc>> {
+        None
+    }
+
     /// Get the underlying XML node for this object, if it exists.
     fn as_xml_node(&self) -> Option<XmlNode<'gc>> {
         None
@@ -548,11 +555,6 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
 
     /// Get the underlying `DateObject`, if it exists
     fn as_date_object(&self) -> Option<DateObject<'gc>> {
-        None
-    }
-
-    /// Get the underlying `ColorTransformObject`, if it exists
-    fn as_color_transform_object(&self) -> Option<ColorTransformObject<'gc>> {
         None
     }
 
@@ -608,11 +610,6 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
 
     /// Get the underlying `BitmapDataObject`, if it exists
     fn as_bitmap_data_object(&self) -> Option<BitmapDataObject<'gc>> {
-        None
-    }
-
-    /// Get the underlying `TextFormatObject`, if it exists
-    fn as_text_format_object(&self) -> Option<TextFormatObject<'gc>> {
         None
     }
 
@@ -699,7 +696,7 @@ pub fn search_prototype<'gc>(
                 let result = exec.exec(
                     ExecutionName::Static("[Getter]"),
                     activation,
-                    this,
+                    this.into(),
                     1,
                     &[],
                     ExecutionReason::Special,

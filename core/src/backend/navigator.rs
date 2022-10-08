@@ -3,71 +3,11 @@
 use crate::loader::Error;
 use crate::string::WStr;
 use indexmap::IndexMap;
-use std::borrow::Cow;
-use std::collections::VecDeque;
-use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::ptr::null;
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-use std::time::Duration;
 use swf::avm1::types::SendVarsMethod;
-use url::{ParseError, Url};
-
-/// Attempt to convert a relative filesystem path into an absolute `file:///`
-/// URL.
-///
-/// If the relative path is an absolute path, the base will not be used, but it
-/// will still be parsed into a `Url`.
-///
-/// This is the desktop version of this function, which actually carries out
-/// the above instructions. On non-Unix, non-Windows, non-Redox environments,
-/// this function always yields an error.
-#[cfg(any(unix, windows, target_os = "redox"))]
-pub fn url_from_relative_path<P: AsRef<Path>>(base: P, relative: &str) -> Result<Url, ParseError> {
-    let parsed = Url::from_file_path(relative);
-    if let Err(()) = parsed {
-        let base =
-            Url::from_directory_path(base).map_err(|_| ParseError::RelativeUrlWithoutBase)?;
-
-        return base.join(relative);
-    }
-
-    Ok(parsed.unwrap())
-}
-
-/// Attempt to convert a relative filesystem path into an absolute `file:///`
-/// URL.
-///
-/// If the relative path is an absolute path, the base will not be used, but it
-/// will still be parsed into a `Url`.
-///
-/// This is the web version of this function, which always yields an error. On
-/// Unix, Windows, or Redox, this function actually carries out the above
-/// instructions.
-#[cfg(not(any(unix, windows, target_os = "redox")))]
-pub fn url_from_relative_path<P: AsRef<Path>>(
-    _base: P,
-    _relative: &str,
-) -> Result<Url, ParseError> {
-    Err(ParseError::RelativeUrlWithoutBase)
-}
-
-/// Attempt to convert a relative URL into an absolute URL, using the base URL
-/// if necessary.
-///
-/// If the relative URL is actually absolute, then the base will not be used.
-pub fn url_from_relative_url(base: &str, relative: &str) -> Result<Url, ParseError> {
-    let parsed = Url::parse(relative);
-    if let Err(ParseError::RelativeUrlWithoutBase) = parsed {
-        let base = Url::parse(base)?;
-        return base.join(relative);
-    }
-
-    parsed
-}
+use url::Url;
 
 /// Enumerates all possible navigation methods.
 #[derive(Copy, Clone)]
@@ -100,8 +40,11 @@ impl NavigationMethod {
     }
 }
 
-/// Represents request options to be sent as part of a fetch.
-pub struct RequestOptions {
+/// A fetch request.
+pub struct Request {
+    /// The URL of the request.
+    url: String,
+
     /// The HTTP method to be used to make the request.
     method: NavigationMethod,
 
@@ -112,21 +55,34 @@ pub struct RequestOptions {
     body: Option<(Vec<u8>, String)>,
 }
 
-impl RequestOptions {
-    /// Construct request options for a GET request.
-    pub fn get() -> Self {
+impl Request {
+    /// Construct a GET request.
+    pub fn get(url: String) -> Self {
         Self {
+            url,
             method: NavigationMethod::Get,
             body: None,
         }
     }
 
-    /// Construct request options for a POST request.
-    pub fn post(body: Option<(Vec<u8>, String)>) -> Self {
+    /// Construct a POST request.
+    pub fn post(url: String, body: Option<(Vec<u8>, String)>) -> Self {
         Self {
+            url,
             method: NavigationMethod::Post,
             body,
         }
+    }
+
+    /// Construct a request with the given method and data
+    #[allow(clippy::self_named_constructors)]
+    pub fn request(method: NavigationMethod, url: String, body: Option<(Vec<u8>, String)>) -> Self {
+        Self { url, method, body }
+    }
+
+    /// Retrieve the URL of this request.
+    pub fn url(&self) -> &str {
+        &self.url
     }
 
     /// Retrieve the navigation method for this request.
@@ -138,6 +94,15 @@ impl RequestOptions {
     pub fn body(&self) -> &Option<(Vec<u8>, String)> {
         &self.body
     }
+}
+
+/// A response to a fetch request.
+pub struct Response {
+    /// The final URL obtained after any redirects.
+    pub url: String,
+
+    /// The contents of the response body.
+    pub body: Vec<u8>,
 }
 
 /// Type alias for pinned, boxed, and owned futures that output a falliable
@@ -152,8 +117,8 @@ pub trait NavigatorBackend {
     /// be meaningful for all environments: for example, `javascript:` URLs may
     /// not be executable in a desktop context.
     ///
-    /// The `window` parameter, if provided, should be treated identically to
-    /// the `window` parameter on an HTML `<a>nchor` tag.
+    /// The `target` parameter, should be treated identically to the `target`
+    /// parameter on an HTML `<a>nchor` tag.
     ///
     /// This function may be used to send variables to an eligible target. If
     /// desired, the `vars_method` will be specified with a suitable
@@ -171,16 +136,12 @@ pub trait NavigatorBackend {
     fn navigate_to_url(
         &self,
         url: String,
-        window: Option<String>,
+        target: String,
         vars_method: Option<(NavigationMethod, IndexMap<String, String>)>,
     );
 
-    /// Fetch data at a given URL and return it some time in the future.
-    fn fetch(&self, url: &str, request_options: RequestOptions) -> OwnedFuture<Vec<u8>, Error>;
-
-    /// Get the amount of time since the SWF was launched.
-    /// Used by the `getTimer` ActionScript call.
-    fn time_since_launch(&mut self) -> Duration;
+    /// Fetch data and return it some time in the future.
+    fn fetch(&self, request: Request) -> OwnedFuture<Response, Error>;
 
     /// Arrange for a future to be run at some point in the... well, future.
     ///
@@ -192,16 +153,6 @@ pub trait NavigatorBackend {
     /// This seems highly limiting.
     fn spawn_future(&mut self, future: OwnedFuture<(), Error>);
 
-    /// Resolve a relative URL.
-    ///
-    /// This function must not change URLs which are already protocol, domain,
-    /// and path absolute. For URLs that are relative, the implementer of
-    /// this function may opt to convert them to absolute using an implementor
-    /// defined base. For a web browser, the most obvious base would be the
-    /// current document's base URL, while the most obvious base for a desktop
-    /// client would be the file-URL form of the current path.
-    fn resolve_relative_url<'a>(&self, url: &'a str) -> Cow<'a, str>;
-
     /// Handle any context specific pre-processing
     ///
     /// Changing http -> https for example. This function may alter any part of the
@@ -209,103 +160,72 @@ pub trait NavigatorBackend {
     fn pre_process_url(&self, url: Url) -> Url;
 }
 
-/// A null implementation of an event loop that only supports blocking.
-pub struct NullExecutor {
-    /// The list of outstanding futures spawned on this executor.
-    futures_queue: VecDeque<OwnedFuture<(), Error>>,
+#[cfg(not(target_family = "wasm"))]
+pub struct NullExecutor(futures::executor::LocalPool);
 
-    /// The source of any additional futures.
-    channel: Receiver<OwnedFuture<(), Error>>,
-}
-
-unsafe fn do_nothing(_data: *const ()) {}
-
-unsafe fn clone(_data: *const ()) -> RawWaker {
-    NullExecutor::raw_waker()
-}
-
-const NULL_VTABLE: RawWakerVTable = RawWakerVTable::new(clone, do_nothing, do_nothing, do_nothing);
-
+#[cfg(not(target_family = "wasm"))]
 impl NullExecutor {
-    /// Construct a new executor.
-    ///
-    /// The sender yielded as part of construction should be given to a
-    /// `NullNavigatorBackend` so that it can spawn futures on this executor.
-    pub fn new() -> (Self, Sender<OwnedFuture<(), Error>>) {
-        let (send, recv) = channel();
-
-        (
-            Self {
-                futures_queue: VecDeque::new(),
-                channel: recv,
-            },
-            send,
-        )
+    pub fn new() -> Self {
+        Self(futures::executor::LocalPool::new())
     }
 
-    /// Construct a do-nothing raw waker.
-    ///
-    /// The RawWaker, because the RawWaker
-    /// interface normally deals with unchecked pointers. We instead just hand
-    /// it a null pointer and do nothing with it, which is trivially sound.
-    fn raw_waker() -> RawWaker {
-        RawWaker::new(null(), &NULL_VTABLE)
+    pub fn spawner(&self) -> NullSpawner {
+        NullSpawner(self.0.spawner())
     }
 
-    /// Copy all outstanding futures into the local queue.
-    fn flush_channel(&mut self) {
-        for future in self.channel.try_iter() {
-            self.futures_queue.push_back(future);
-        }
+    pub fn run(&mut self) {
+        self.0.run();
     }
+}
 
-    /// Poll all in-progress futures.
-    ///
-    /// If any task in the executor yields an error, then this function will
-    /// stop polling futures and return that error. Otherwise, it will yield
-    /// `Ok`, indicating that no errors occurred. More work may still be
-    /// available,
-    pub fn poll_all(&mut self) -> Result<(), Error> {
-        self.flush_channel();
+impl Default for NullExecutor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
-        let mut unfinished_futures = VecDeque::new();
-        let mut result = Ok(());
+#[cfg(not(target_family = "wasm"))]
+pub struct NullSpawner(futures::executor::LocalSpawner);
 
-        while let Some(mut future) = self.futures_queue.pop_front() {
-            let waker = unsafe { Waker::from_raw(Self::raw_waker()) };
-            let mut context = Context::from_waker(&waker);
-
-            match future.as_mut().poll(&mut context) {
-                Poll::Ready(v) if v.is_err() => {
-                    result = v;
-                    break;
-                }
-                Poll::Ready(_) => continue,
-                Poll::Pending => unfinished_futures.push_back(future),
+#[cfg(not(target_family = "wasm"))]
+impl NullSpawner {
+    pub fn spawn_local(&self, future: OwnedFuture<(), Error>) {
+        use futures::task::LocalSpawnExt;
+        let _ = self.0.spawn_local(async move {
+            if let Err(e) = future.await {
+                log::error!("Asynchronous error occurred: {}", e);
             }
-        }
+        });
+    }
+}
 
-        for future in unfinished_futures {
-            self.futures_queue.push_back(future);
-        }
+#[cfg(target_family = "wasm")]
+pub struct NullExecutor;
 
-        result
+#[cfg(target_family = "wasm")]
+impl NullExecutor {
+    pub fn new() -> Self {
+        Self
     }
 
-    /// Check if work remains in the executor.
-    pub fn has_work(&mut self) -> bool {
-        self.flush_channel();
-
-        !self.futures_queue.is_empty()
+    pub fn spawner(&self) -> NullSpawner {
+        NullSpawner
     }
 
-    /// Block until all futures complete or an error occurs.
-    pub fn block_all(&mut self) -> Result<(), Error> {
-        while self.has_work() {
-            self.poll_all()?;
-        }
+    pub fn run(&mut self) {}
+}
 
-        Ok(())
+#[cfg(target_family = "wasm")]
+pub struct NullSpawner;
+
+#[cfg(target_family = "wasm")]
+impl NullSpawner {
+    pub fn spawn_local(&self, future: OwnedFuture<(), Error>) {
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Err(e) = future.await {
+                log::error!("Asynchronous error occurred: {}", e);
+            }
+        });
     }
 }
 
@@ -314,36 +234,36 @@ impl NullExecutor {
 /// The NullNavigatorBackend includes a trivial executor that holds owned
 /// futures and runs them to completion, blockingly.
 pub struct NullNavigatorBackend {
-    /// The channel upon which all spawned futures will be sent.
-    channel: Option<Sender<OwnedFuture<(), Error>>>,
+    spawner: NullSpawner,
 
     /// The base path for all relative fetches.
     relative_base_path: PathBuf,
 }
 
 impl NullNavigatorBackend {
-    /// Construct a default navigator backend with no async or fetch
-    /// capability.
     pub fn new() -> Self {
-        NullNavigatorBackend {
-            channel: None,
+        let executor = NullExecutor::new();
+        Self {
+            spawner: executor.spawner(),
             relative_base_path: PathBuf::new(),
         }
     }
 
-    /// Construct a navigator backend with fetch and async capability.
-    pub fn with_base_path<P: AsRef<Path>>(
-        path: P,
-        channel: Sender<OwnedFuture<(), Error>>,
-    ) -> Self {
-        let mut relative_base_path = PathBuf::new();
-
-        relative_base_path.push(path);
-
-        NullNavigatorBackend {
-            channel: Some(channel),
-            relative_base_path,
+    pub fn with_base_path(path: &Path, executor: &NullExecutor) -> Self {
+        Self {
+            spawner: executor.spawner(),
+            relative_base_path: path.canonicalize().unwrap(),
         }
+    }
+
+    #[cfg(any(unix, windows, target_os = "redox"))]
+    fn url_from_file_path(path: &Path) -> Result<Url, ()> {
+        Url::from_file_path(path)
+    }
+
+    #[cfg(not(any(unix, windows, target_os = "redox")))]
+    fn url_from_file_path(_path: &Path) -> Result<Url, ()> {
+        Err(())
     }
 }
 
@@ -357,35 +277,28 @@ impl NavigatorBackend for NullNavigatorBackend {
     fn navigate_to_url(
         &self,
         _url: String,
-        _window: Option<String>,
+        _target: String,
         _vars_method: Option<(NavigationMethod, IndexMap<String, String>)>,
     ) {
     }
 
-    fn fetch(&self, url: &str, _opts: RequestOptions) -> OwnedFuture<Vec<u8>, Error> {
+    fn fetch(&self, request: Request) -> OwnedFuture<Response, Error> {
         let mut path = self.relative_base_path.clone();
-        path.push(url);
+        path.push(request.url);
 
-        Box::pin(async move { fs::read(path).map_err(Error::NetworkError) })
-    }
+        Box::pin(async move {
+            let url = Self::url_from_file_path(&path)
+                .map_err(|()| Error::FetchError("Invalid URL".to_string()))?
+                .into();
 
-    fn time_since_launch(&mut self) -> Duration {
-        Duration::from_millis(0)
+            let body = std::fs::read(path).map_err(|e| Error::FetchError(e.to_string()))?;
+
+            Ok(Response { url, body })
+        })
     }
 
     fn spawn_future(&mut self, future: OwnedFuture<(), Error>) {
-        if let Some(channel) = self.channel.as_ref() {
-            channel.send(future).unwrap();
-        }
-    }
-
-    fn resolve_relative_url<'a>(&self, url: &'a str) -> Cow<'a, str> {
-        let relative = url_from_relative_path(&self.relative_base_path, url);
-        if let Ok(relative) = relative {
-            String::from(relative).into()
-        } else {
-            url.into()
-        }
+        self.spawner.spawn_local(future);
     }
 
     fn pre_process_url(&self, url: Url) -> Url {

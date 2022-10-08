@@ -1,4 +1,5 @@
 import * as utils from "./utils";
+import { isSwfFilename, isSwfMimeType } from "ruffle-core";
 
 function isSwf(
     details:
@@ -22,13 +23,11 @@ function isSwf(
         .match(/^\s*(.*?)\s*(?:;.*)?$/)![1];
 
     // Some sites (e.g. swfchan.net) might (wrongly?) send octet-stream, so check file extension too.
-    if (mime === "application/octet-stream") {
-        const url = new URL(details.url);
-        const extension = url.pathname.substring(url.pathname.lastIndexOf("."));
-        return extension.toLowerCase() === ".swf";
+    if (mime.endsWith("octet-stream")) {
+        return isSwfFilename(details.url);
+    } else {
+        return isSwfMimeType(mime);
     }
-
-    return mime === "application/x-shockwave-flash";
 }
 
 function onHeadersReceived(
@@ -38,7 +37,9 @@ function onHeadersReceived(
 ) {
     if (isSwf(details)) {
         const baseUrl = utils.runtime.getURL("player.html");
-        return { redirectUrl: `${baseUrl}?url=${details.url}` };
+        return {
+            redirectUrl: `${baseUrl}?url=${encodeURIComponent(details.url)}`,
+        };
     }
 }
 
@@ -47,7 +48,7 @@ function enable() {
         onHeadersReceived,
         {
             urls: ["<all_urls>"],
-            types: ["main_frame"],
+            types: ["main_frame", "sub_frame"],
         },
         ["blocking", "responseHeaders"]
     );

@@ -4,12 +4,13 @@ use crate::avm1::function::{Executable, FunctionObject};
 use crate::avm1::property::Attribute;
 use crate::avm1::property_decl::{define_properties_on, Declaration};
 use crate::avm1::{Object, ScriptObject, TObject, Value};
+use crate::display_object::{DisplayObject, Lists, TDisplayObject, TDisplayObjectContainer};
 use crate::string::{AvmString, WStr, WString};
 use gc_arena::Collect;
 use gc_arena::MutationContext;
-use rand::Rng;
 use std::str;
 
+mod accessibility;
 mod array;
 pub(crate) mod as_broadcaster;
 mod bevel_filter;
@@ -20,13 +21,12 @@ pub(crate) mod boolean;
 pub(crate) mod button;
 mod color;
 pub mod color_matrix_filter;
-mod color_transform;
+pub(crate) mod color_transform;
 pub(crate) mod context_menu;
 pub(crate) mod context_menu_item;
 pub mod convolution_filter;
 mod date;
 pub mod displacement_map_filter;
-pub(crate) mod display_object;
 pub mod drop_shadow_filter;
 pub(crate) mod error;
 mod external_interface;
@@ -36,6 +36,7 @@ pub mod gradient_bevel_filter;
 pub mod gradient_glow_filter;
 mod key;
 mod load_vars;
+mod local_connection;
 mod math;
 mod matrix;
 pub(crate) mod mouse;
@@ -47,7 +48,7 @@ mod point;
 mod rectangle;
 mod selection;
 pub(crate) mod shared_object;
-mod sound;
+pub(crate) mod sound;
 mod stage;
 pub(crate) mod string;
 pub(crate) mod system;
@@ -62,11 +63,11 @@ mod xml;
 mod xml_node;
 
 const GLOBAL_DECLS: &[Declaration] = declare_properties! {
+    "trace" => method(trace; DONT_ENUM);
     "isFinite" => method(is_finite; DONT_ENUM);
     "isNaN" => method(is_nan; DONT_ENUM);
     "parseInt" => method(parse_int; DONT_ENUM);
     "parseFloat" => method(parse_float; DONT_ENUM);
-    "random" => method(random; DONT_ENUM);
     "ASSetPropFlags" => method(object::as_set_prop_flags; DONT_ENUM);
     "clearInterval" => method(clear_interval; DONT_ENUM);
     "setInterval" => method(set_interval; DONT_ENUM);
@@ -79,15 +80,20 @@ const GLOBAL_DECLS: &[Declaration] = declare_properties! {
     "Infinity" => property(get_infinity; DONT_ENUM);
 };
 
-pub fn random<'gc>(
+pub fn trace<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     _this: Object<'gc>,
     args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    match args.get(0) {
-        Some(&Value::Number(max)) => Ok(activation.context.rng.gen_range(0.0..max).floor().into()),
-        _ => Ok(Value::Undefined), //TODO: Shouldn't this be an error condition?
-    }
+    // Unlike `Action::Trace`, `_global.trace` always coerces
+    // undefined to "" in SWF6 and below. It also doesn't log
+    // anything outside of the Flash editor's trace window.
+    let out = args
+        .get(0)
+        .unwrap_or(&Value::Undefined)
+        .coerce_to_string(activation)?;
+    activation.context.avm_trace(&out.to_utf8_lossy());
+    Ok(Value::Undefined)
 }
 
 pub fn is_finite<'gc>(
@@ -95,12 +101,11 @@ pub fn is_finite<'gc>(
     _this: Object<'gc>,
     args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    let ret = args
-        .get(0)
-        .unwrap_or(&Value::Undefined)
-        .coerce_to_f64(activation)?
-        .is_finite();
-    Ok(ret.into())
+    if let Some(val) = args.get(0) {
+        Ok(val.coerce_to_f64(activation)?.is_finite().into())
+    } else {
+        Ok(false.into())
+    }
 }
 
 pub fn is_nan<'gc>(
@@ -249,76 +254,17 @@ pub fn get_nan<'gc>(
     }
 }
 
-pub fn parse_float_impl(s: &WStr, allow_multiple_dots: bool) -> f64 {
-    let mut out_str = String::with_capacity(s.len());
-
-    // TODO: Implementing this in a very janky way for now,
-    // feeding the string to Rust's float parser.
-    // Flash's parser is much more lenient, so we have to massage
-    // the string into an acceptable format.
-    let mut allow_dot = true;
-    let mut allow_exp = true;
-    let mut allow_sign = true;
-    for unit in s.iter() {
-        let c = match u8::try_from(unit) {
-            Ok(c) => c,
-            // Invalid char, `parseFloat` ignores all trailing garbage.
-            Err(_) => break,
-        };
-
-        match c {
-            b'0'..=b'9' => {
-                allow_sign = false;
-                out_str.push(c.into());
-            }
-            b'+' | b'-' if allow_sign => {
-                // Sign allowed at first char and following e
-                allow_sign = false;
-                out_str.push(c.into());
-            }
-            b'.' if allow_exp => {
-                allow_sign = false;
-                if allow_dot {
-                    allow_dot = false;
-                    out_str.push(c.into());
-                } else {
-                    // AVM1 allows multiple . except after e
-                    if allow_multiple_dots {
-                        allow_exp = false;
-                    } else {
-                        break;
-                    }
-                }
-            }
-            b'e' | b'E' if allow_exp => {
-                allow_sign = true;
-                allow_exp = false;
-                allow_dot = false;
-                out_str.push(c.into());
-            }
-
-            // Invalid char, `parseFloat` ignores all trailing garbage.
-            _ => break,
-        };
-    }
-
-    out_str.parse::<f64>().unwrap_or(f64::NAN)
-}
-
 pub fn parse_float<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     _this: Object<'gc>,
     args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    let s = if let Some(val) = args.get(0) {
-        val.coerce_to_string(activation)?
+    if let Some(value) = args.get(0) {
+        let string = value.coerce_to_string(activation)?;
+        Ok(crate::avm1::value::parse_float_impl(&string, false).into())
     } else {
-        return Ok(f64::NAN.into());
-    };
-
-    let s = s.trim_start();
-
-    Ok(parse_float_impl(s, true).into())
+        Ok(Value::Undefined)
+    }
 }
 
 pub fn set_interval<'gc>(
@@ -344,36 +290,43 @@ pub fn create_timer<'gc>(
     is_timeout: bool,
 ) -> Result<Value<'gc>, Error<'gc>> {
     // `setInterval` was added in Flash Player 6 but is not version-gated.
-    use crate::avm1::timer::TimerCallback;
-    let (callback, i) = match args.get(0) {
-        Some(Value::Object(o)) if o.as_executable().is_some() => (TimerCallback::Function(*o), 1),
+    use crate::timer::TimerCallback;
+
+    let (callback, interval) = match args.get(0) {
+        Some(Value::Object(o)) if o.as_executable().is_some() => (
+            TimerCallback::Avm1Function {
+                func: *o,
+                params: args.get(2..).unwrap_or_default().to_vec(),
+            },
+            args.get(1),
+        ),
         Some(Value::Object(o)) => (
-            TimerCallback::Method {
+            TimerCallback::Avm1Method {
                 this: *o,
                 method_name: args
                     .get(1)
                     .unwrap_or(&Value::Undefined)
                     .coerce_to_string(activation)?,
+                params: args.get(3..).map(|s| s.to_vec()).unwrap_or_default(),
             },
-            2,
+            args.get(2),
         ),
         _ => return Ok(Value::Undefined),
     };
 
-    let interval = match args.get(i).unwrap_or(&Value::Undefined) {
+    let interval = match interval.unwrap_or(&Value::Undefined) {
         Value::Undefined => return Ok(Value::Undefined),
         value => value.coerce_to_i32(activation)?,
     };
-    let params = if let Some(params) = args.get(i + 1..) {
-        params.to_vec()
-    } else {
-        vec![]
-    };
 
+    // If `is_timeout` is true, then set a repeat count of 1.
+    // Otherwise, set a repeat count of 0 (repeat indefinitely)
+    //
+    // We start the timer immediately
     let id = activation
         .context
         .timers
-        .add_timer(callback, interval, params, is_timeout);
+        .add_timer(callback, interval, is_timeout);
 
     Ok(id.into())
 }
@@ -444,9 +397,7 @@ pub fn escape<'gc>(
             // ECMA-262 violation: Avm1 does not support unicode escapes.
             _ => {
                 const DIGITS: &[u8; 16] = b"0123456789ABCDEF";
-                buffer.push(b'%');
-                buffer.push(DIGITS[(c / 16) as usize]);
-                buffer.push(DIGITS[(c % 16) as usize]);
+                buffer.extend([b'%', DIGITS[(c / 16) as usize], DIGITS[(c % 16) as usize]]);
             }
         };
     }
@@ -581,7 +532,7 @@ pub fn create_globals<'gc>(
     Object<'gc>,
     as_broadcaster::BroadcasterFunctions<'gc>,
 ) {
-    let object_proto = ScriptObject::object_cell(gc_context, None);
+    let object_proto = ScriptObject::new(gc_context, None).into();
     let function_proto = function::create_proto(gc_context, object_proto);
 
     object::fill_proto(gc_context, object_proto, function_proto);
@@ -609,6 +560,8 @@ pub fn create_globals<'gc>(
     let number_proto = number::create_proto(gc_context, object_proto, function_proto);
     let boolean_proto = boolean::create_proto(gc_context, object_proto, function_proto);
     let load_vars_proto = load_vars::create_proto(gc_context, object_proto, function_proto);
+    let local_connection_proto =
+        local_connection::create_proto(gc_context, object_proto, function_proto);
     let matrix_proto = matrix::create_proto(gc_context, object_proto, function_proto);
     let point_proto = point::create_proto(gc_context, object_proto, function_proto);
     let rectangle_proto = rectangle::create_proto(gc_context, object_proto, function_proto);
@@ -682,6 +635,13 @@ pub fn create_globals<'gc>(
         Some(function_proto),
         load_vars_proto,
     );
+    let local_connection = FunctionObject::constructor(
+        gc_context,
+        Executable::Native(local_connection::constructor),
+        constructor_to_fn!(local_connection::constructor),
+        Some(function_proto),
+        local_connection_proto,
+    );
     let movie_clip = FunctionObject::constructor(
         gc_context,
         Executable::Native(movie_clip::constructor),
@@ -731,11 +691,11 @@ pub fn create_globals<'gc>(
     let boolean = boolean::create_boolean_object(gc_context, boolean_proto, Some(function_proto));
     let date = date::create_date_object(gc_context, date_proto, function_proto);
 
-    let flash = ScriptObject::object(gc_context, Some(object_proto));
+    let flash = ScriptObject::new(gc_context, Some(object_proto));
 
-    let geom = ScriptObject::object(gc_context, Some(object_proto));
-    let filters = ScriptObject::object(gc_context, Some(object_proto));
-    let display = ScriptObject::object(gc_context, Some(object_proto));
+    let geom = ScriptObject::new(gc_context, Some(object_proto));
+    let filters = ScriptObject::new(gc_context, Some(object_proto));
+    let display = ScriptObject::new(gc_context, Some(object_proto));
 
     let matrix = matrix::create_matrix_object(gc_context, matrix_proto, Some(function_proto));
     let point = point::create_point_object(gc_context, point_proto, function_proto);
@@ -959,7 +919,7 @@ pub fn create_globals<'gc>(
         Attribute::empty(),
     );
 
-    let external = ScriptObject::object(gc_context, Some(object_proto));
+    let external = ScriptObject::new(gc_context, Some(object_proto));
     let external_interface = external_interface::create_external_interface_object(
         gc_context,
         external_interface_proto,
@@ -974,7 +934,7 @@ pub fn create_globals<'gc>(
         Attribute::empty(),
     );
 
-    let globals = ScriptObject::bare_object(gc_context);
+    let globals = ScriptObject::new(gc_context, None);
     globals.define_value(
         gc_context,
         "AsBroadcaster",
@@ -997,6 +957,12 @@ pub fn create_globals<'gc>(
         gc_context,
         "LoadVars",
         load_vars.into(),
+        Attribute::DONT_ENUM,
+    );
+    globals.define_value(
+        gc_context,
+        "LocalConnection",
+        local_connection.into(),
         Attribute::DONT_ENUM,
     );
     globals.define_value(
@@ -1147,6 +1113,16 @@ pub fn create_globals<'gc>(
         )),
         Attribute::DONT_ENUM,
     );
+    globals.define_value(
+        gc_context,
+        "Accessibility",
+        Value::Object(accessibility::create_accessibility_object(
+            gc_context,
+            Some(object_proto),
+            function_proto,
+        )),
+        Attribute::DONT_ENUM,
+    );
 
     define_properties_on(GLOBAL_DECLS, gc_context, globals, function_proto);
 
@@ -1213,6 +1189,51 @@ pub fn create_globals<'gc>(
         globals.into(),
         broadcaster_functions,
     )
+}
+
+/// Depths used/returned by ActionScript are offset by this amount from depths used inside the SWF/by the VM.
+/// The depth of objects placed on the timeline in the Flash IDE start from 0 in the SWF,
+/// but are negative when queried from MovieClip.getDepth().
+/// Add this to convert from AS -> SWF depth.
+const AVM_DEPTH_BIAS: i32 = 16384;
+
+/// The maximum depth that the AVM will allow you to swap or attach clips to.
+/// What is the derivation of this number...?
+const AVM_MAX_DEPTH: i32 = 2_130_706_428;
+
+/// The maximum depth that the AVM will allow you to remove clips from.
+/// What is the derivation of this number...?
+const AVM_MAX_REMOVE_DEPTH: i32 = 2_130_706_416;
+
+fn get_depth<'gc>(
+    activation: &mut Activation<'_, 'gc, '_>,
+    this: Object<'gc>,
+    _args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    if let Some(display_object) = this.as_display_object() {
+        if activation.swf_version() >= 6 {
+            let depth = display_object.depth().wrapping_sub(AVM_DEPTH_BIAS);
+            return Ok(depth.into());
+        }
+    }
+    Ok(Value::Undefined)
+}
+
+pub fn remove_display_object<'gc>(
+    this: DisplayObject<'gc>,
+    activation: &mut Activation<'_, 'gc, '_>,
+) {
+    let depth = this.depth().wrapping_sub(0);
+    // Can only remove positive depths (when offset by the AVM depth bias).
+    // Generally this prevents you from removing non-dynamically created clips,
+    // although you can get around it with swapDepths.
+    // TODO: Figure out the derivation of this range.
+    if depth >= AVM_DEPTH_BIAS && depth < AVM_MAX_REMOVE_DEPTH && !this.removed() {
+        // Need a parent to remove from.
+        if let Some(mut parent) = this.avm1_parent().and_then(|o| o.as_movie_clip()) {
+            parent.remove_child(&mut activation.context, this, Lists::all());
+        }
+    }
 }
 
 #[cfg(test)]

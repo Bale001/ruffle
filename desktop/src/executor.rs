@@ -147,17 +147,15 @@ impl GlutinAsyncExecutor {
         event_loop: EventLoopProxy<RuffleEvent>,
     ) -> (Arc<Mutex<Self>>, Sender<OwnedFuture<(), Error>>) {
         let (send, recv) = channel();
-        let new_self = Arc::new(Mutex::new(Self {
-            task_queue: Arena::new(),
-            channel: recv,
-            self_ref: Weak::new(),
-            event_loop,
-            waiting_for_poll: false,
-        }));
-        let self_ref = Arc::downgrade(&new_self);
-
-        new_self.lock().expect("locked self").self_ref = self_ref;
-
+        let new_self = Arc::new_cyclic(|self_ref| {
+            Mutex::new(Self {
+                task_queue: Arena::new(),
+                channel: recv,
+                self_ref: self_ref.clone(),
+                event_loop,
+                waiting_for_poll: false,
+            })
+        });
         (new_self, send)
     }
 
@@ -200,9 +198,9 @@ impl GlutinAsyncExecutor {
     fn wake(&mut self, task: Index) {
         if let Some(task) = self.task_queue.get_mut(task) {
             if !task.is_completed() {
+                task.set_ready();
                 if !self.waiting_for_poll {
                     self.waiting_for_poll = true;
-                    task.set_ready();
                     if self.event_loop.send_event(RuffleEvent::TaskPoll).is_err() {
                         log::warn!("A task was queued on an event loop that has already ended. It will not be polled.");
                     }

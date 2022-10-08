@@ -1,3 +1,6 @@
+/**
+ * Represents the various types of auto-play behaviours that are supported.
+ */
 export const enum AutoPlay {
     /**
      * The player should automatically play the movie as soon as it is loaded.
@@ -77,6 +80,44 @@ export const enum LogLevel {
 }
 
 /**
+ * The window mode of a Ruffle player.
+ */
+export const enum WindowMode {
+    /*
+     * The Flash content is rendered in its own window and layering is done with the browser's
+     * default behavior.
+     *
+     * In Ruffle, this mode functions like `WindowMode::Opaque` and will layer the Flash content
+     * together with other HTML elements.
+     */
+    Window = "window",
+
+    /*
+     * The Flash content is layered together with other HTML elements, and the stage color is
+     * opaque. Content can render above or below Ruffle based on CSS rendering order.
+     */
+    Opaque = "opaque",
+
+    /*
+     * The Flash content is layered together with other HTML elements, and the SWF stage color is
+     * transparent. Content beneath Ruffle will be visible through transparent areas.
+     */
+    Transparent = "transparent",
+
+    /*
+     * Request compositing with hardware acceleration when possible.
+     * This mode has no effect in Ruffle and will function like `WindowMode.Opaque`.
+     */
+    Direct = "direct",
+
+    /*
+     * Request a direct rendering path, bypassing browser compositing when possible.
+     * This mode has no effect in Ruffle and will function like `WindowMode::Opaque`.
+     */
+    Gpu = "gpu",
+}
+
+/**
  * Any options used for loading a movie.
  */
 export interface BaseLoadOptions {
@@ -97,6 +138,8 @@ export interface BaseLoadOptions {
      * If a URL if specified when loading the movie, some parameters will
      * be extracted by the query portion of that URL and then overwritten
      * by any explicitly set here.
+     *
+     * @default {}
      */
     parameters?: URLSearchParams | string | Record<string, string>;
 
@@ -177,10 +220,17 @@ export interface BaseLoadOptions {
     contextMenu?: boolean;
 
     /**
+     * Whether or not to show a preloader before the SWF has loaded with Ruffle.
+     *
+     * @default true
+     */
+    preloader?: boolean;
+
+    /**
      * Maximum amount of time a script can take before scripting
      * is disabled.
      *
-     * @default {"secs": 15, "nanos": 0}
+     * @default { secs: 15, nanos: 0 }
      */
     maxExecutionDuration?: {
         secs: number;
@@ -205,7 +255,6 @@ export interface BaseLoadOptions {
     menu?: boolean;
 
     /**
-     *
      * This is equivalent to Stage.align.
      *
      * @default ""
@@ -213,7 +262,6 @@ export interface BaseLoadOptions {
     salign?: string;
 
     /**
-     *
      * This is equivalent to Stage.quality.
      *
      * @default "high"
@@ -221,12 +269,20 @@ export interface BaseLoadOptions {
     quality?: string;
 
     /**
-     *
      * This is equivalent to Stage.scaleMode.
      *
      * @default "showAll"
      */
     scale?: string;
+
+    /**
+     * The window mode of the Ruffle player.
+     *
+     * This setting controls how the Ruffle container is layered and rendered with other content on the page.
+     *
+     * @default WindowMode.Window
+     */
+    wmode?: WindowMode;
 }
 
 /**

@@ -1,7 +1,7 @@
 import { Version } from "./version";
 import { VersionRange } from "./version-range";
 import { SourceAPI } from "./source-api";
-import { Config } from "./config";
+import type { Config } from "./config";
 
 declare global {
     interface Window {
@@ -32,7 +32,7 @@ export class PublicAPI {
      */
     config: Config;
 
-    private sources: Record<string, SourceAPI>;
+    private sources: Record<string, typeof SourceAPI>;
     private invoked: boolean;
     private newestName: string | null;
     private conflict: Record<string, unknown> | null;
@@ -83,7 +83,9 @@ export class PublicAPI {
         }
 
         if (document.readyState === "loading") {
-            window.addEventListener("DOMContentLoaded", this.init.bind(this));
+            // Cloudflare Rocket Loader interferes with the DOMContentLoaded event,
+            // so we listen for readystatechange instead
+            document.addEventListener("readystatechange", this.init.bind(this));
         } else {
             window.setTimeout(this.init.bind(this), 0);
         }
@@ -109,11 +111,9 @@ export class PublicAPI {
      * Register a given source with the Ruffle Public API.
      *
      * @param name The name of the source.
-     * @param api The public API object. This must conform to the shape
-     * of `SourceAPI`.
      */
-    registerSource(name: string, api: SourceAPI): void {
-        this.sources[name] = api;
+    registerSource(name: string): void {
+        this.sources[name] = SourceAPI;
     }
 
     /**
@@ -170,9 +170,9 @@ export class PublicAPI {
      *
      * @returns An instance of the Source API.
      */
-    newest(): SourceAPI | null {
+    newest(): typeof SourceAPI | null {
         const name = this.newestSourceName();
-        return name != null ? this.sources[name] : null;
+        return name !== null ? this.sources[name] : null;
     }
 
     /**
@@ -184,7 +184,7 @@ export class PublicAPI {
      * @returns An instance of the Source API, if one or more
      * sources satisfied the requirement.
      */
-    satisfying(ver_requirement: string): SourceAPI | null {
+    satisfying(ver_requirement: string): typeof SourceAPI | null {
         const requirement = VersionRange.fromRequirementString(ver_requirement);
         let valid = null;
 
@@ -207,7 +207,7 @@ export class PublicAPI {
      *
      * @returns An instance of the Source API
      */
-    localCompatible(): SourceAPI | null {
+    localCompatible(): typeof SourceAPI | null {
         if (this.sources.local !== undefined) {
             return this.satisfying("^" + this.sources.local.version);
         } else {
@@ -221,7 +221,7 @@ export class PublicAPI {
      *
      * @returns An instance of the Source API
      */
-    local(): SourceAPI | null {
+    local(): typeof SourceAPI | null {
         if (this.sources.local !== undefined) {
             return this.satisfying("=" + this.sources.local.version);
         } else {
@@ -261,7 +261,6 @@ export class PublicAPI {
      * version of Ruffle, since there is no Public API to upgrade from.
      * @param sourceName The name of this particular
      * Ruffle source.
-     * @param sourceAPI The Ruffle source to add.
      *
      * If both parameters are provided they will be used to define a new Ruffle
      * source to register with the public API.
@@ -269,8 +268,7 @@ export class PublicAPI {
      */
     static negotiate(
         prevRuffle: PublicAPI | null | Record<string, unknown>,
-        sourceName: string | undefined,
-        sourceAPI: SourceAPI | undefined
+        sourceName: string | undefined
     ): PublicAPI {
         let publicAPI: PublicAPI;
         if (prevRuffle instanceof PublicAPI) {
@@ -279,8 +277,8 @@ export class PublicAPI {
             publicAPI = new PublicAPI(prevRuffle);
         }
 
-        if (sourceName !== undefined && sourceAPI !== undefined) {
-            publicAPI.registerSource(sourceName, sourceAPI);
+        if (sourceName !== undefined) {
+            publicAPI.registerSource(sourceName);
 
             // Install the faux plugin detection immediately.
             // This is necessary because scripts such as SWFObject check for the
@@ -288,7 +286,7 @@ export class PublicAPI {
             // TODO: Maybe there's a better place for this.
             const polyfills = publicAPI.config.polyfills;
             if (polyfills !== false) {
-                sourceAPI.pluginPolyfill();
+                SourceAPI.pluginPolyfill();
             }
         }
 

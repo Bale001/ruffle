@@ -1,6 +1,5 @@
 use crate::{
     avm1::SoundObject,
-    avm2::Event as Avm2Event,
     avm2::SoundChannelObject,
     display_object::{self, DisplayObject, MovieClip, TDisplayObject},
 };
@@ -8,6 +7,7 @@ use downcast_rs::Downcast;
 use gc_arena::Collect;
 use generational_arena::{Arena, Index};
 
+#[cfg(feature = "audio")]
 pub mod decoders;
 pub mod swf {
     pub use swf::{
@@ -16,53 +16,46 @@ pub mod swf {
     };
 }
 
+#[cfg(feature = "audio")]
 mod mixer;
+#[cfg(feature = "audio")]
 pub use mixer::*;
+
+#[cfg(not(feature = "audio"))]
+mod decoders {
+    #[derive(Debug, thiserror::Error)]
+    pub enum Error {}
+}
+
+use instant::Duration;
+use thiserror::Error;
 
 pub type SoundHandle = Index;
 pub type SoundInstanceHandle = Index;
-pub type PreloadStreamHandle = u32;
+pub type DecodeError = decoders::Error;
 
-type Error = Box<dyn std::error::Error>;
+#[derive(Debug, Error)]
+pub enum RegisterError {
+    #[error("MP3 sound is too short")]
+    ShortMp3,
+}
 
 pub trait AudioBackend: Downcast {
     fn play(&mut self);
     fn pause(&mut self);
-    fn register_sound(&mut self, swf_sound: &swf::Sound) -> Result<SoundHandle, Error>;
 
-    /// Used by the web backend to pre-decode sound streams.
-    /// Returns the sound handle to be used to add data to the stream.
-    /// Other backends return `None`.
-    /// TODO: Get rid of the preload_* methods when web backend has a better way
-    /// of decoding audio on the fly.
-    fn preload_sound_stream_head(
-        &mut self,
-        _stream_info: &swf::SoundStreamHead,
-    ) -> Option<PreloadStreamHandle> {
-        None
-    }
+    /// Registers an sound embedded in an SWF.
+    fn register_sound(&mut self, swf_sound: &swf::Sound) -> Result<SoundHandle, RegisterError>;
 
-    /// Used by the web backend to add data to a currently preloading sound stream.
-    fn preload_sound_stream_block(
-        &mut self,
-        _stream: PreloadStreamHandle,
-        _clip_frame: u16,
-        _audio_data: &[u8],
-    ) {
-    }
-
-    /// Used by the web backend to finalize and decode a sound stream.
-    /// Returns true if this was a valid stream.
-    fn preload_sound_stream_end(&mut self, _stream: PreloadStreamHandle) -> Option<SoundHandle> {
-        None
-    }
+    /// Registers MP3 audio from an external source.
+    fn register_mp3(&mut self, data: &[u8]) -> Result<SoundHandle, DecodeError>;
 
     /// Plays a sound.
     fn start_sound(
         &mut self,
         sound: SoundHandle,
         settings: &swf::SoundInfo,
-    ) -> Result<SoundInstanceHandle, Error>;
+    ) -> Result<SoundInstanceHandle, DecodeError>;
 
     /// Starts playing a "stream" sound, which is an audio stream that is distributed
     /// among the frames of a Flash MovieClip.
@@ -74,7 +67,7 @@ pub trait AudioBackend: Downcast {
         clip_frame: u16,
         clip_data: crate::tag_utils::SwfSlice,
         handle: &swf::SoundStreamHead,
-    ) -> Result<SoundInstanceHandle, Error>;
+    ) -> Result<SoundInstanceHandle, DecodeError>;
 
     /// Stops a playing sound instance.
     /// No-op if the sound is not playing.
@@ -118,6 +111,20 @@ pub trait AudioBackend: Downcast {
     /// what the stage frame rate is. Otherwise, you are free to avoid
     /// implementing it.
     fn set_frame_rate(&mut self, _frame_rate: f64) {}
+
+    /// The approximate interval that this backend updates a sound's position value. `None` if the
+    /// value is unknown.
+    ///
+    /// This determines the time threshold for syncing embedded audio streams to the animation.
+    fn position_resolution(&self) -> Option<Duration> {
+        None
+    }
+
+    /// Returns the master volume of the audio backend.
+    fn volume(&self) -> f32;
+
+    /// Sets the master volume of the audio backend.
+    fn set_volume(&mut self, volume: f32);
 }
 
 impl_downcast!(AudioBackend);
@@ -137,12 +144,14 @@ struct NullSound {
 /// Audio backend that ignores all audio.
 pub struct NullAudioBackend {
     sounds: Arena<NullSound>,
+    volume: f32,
 }
 
 impl NullAudioBackend {
     pub fn new() -> NullAudioBackend {
         NullAudioBackend {
             sounds: Arena::new(),
+            volume: 1.0,
         }
     }
 }
@@ -150,10 +159,10 @@ impl NullAudioBackend {
 impl AudioBackend for NullAudioBackend {
     fn play(&mut self) {}
     fn pause(&mut self) {}
-    fn register_sound(&mut self, sound: &swf::Sound) -> Result<SoundHandle, Error> {
+    fn register_sound(&mut self, sound: &swf::Sound) -> Result<SoundHandle, RegisterError> {
         // Slice off latency seek for MP3 data.
         let data = if sound.format.compression == swf::AudioCompression::Mp3 {
-            &sound.data[2..]
+            sound.data.get(2..).ok_or(RegisterError::ShortMp3)?
         } else {
             sound.data
         };
@@ -170,11 +179,24 @@ impl AudioBackend for NullAudioBackend {
         }))
     }
 
+    fn register_mp3(&mut self, _data: &[u8]) -> Result<SoundHandle, DecodeError> {
+        Ok(self.sounds.insert(NullSound {
+            size: 0,
+            duration: 0.0,
+            format: swf::SoundFormat {
+                compression: swf::AudioCompression::Mp3,
+                sample_rate: 44100,
+                is_stereo: true,
+                is_16_bit: true,
+            },
+        }))
+    }
+
     fn start_sound(
         &mut self,
         _sound: SoundHandle,
         _sound_info: &swf::SoundInfo,
-    ) -> Result<SoundInstanceHandle, Error> {
+    ) -> Result<SoundInstanceHandle, DecodeError> {
         Ok(SoundInstanceHandle::from_raw_parts(0, 0))
     }
 
@@ -184,7 +206,7 @@ impl AudioBackend for NullAudioBackend {
         _clip_frame: u16,
         _clip_data: crate::tag_utils::SwfSlice,
         _handle: &swf::SoundStreamHead,
-    ) -> Result<SoundInstanceHandle, Error> {
+    ) -> Result<SoundInstanceHandle, DecodeError> {
         Ok(SoundInstanceHandle::from_raw_parts(0, 0))
     }
 
@@ -214,6 +236,14 @@ impl AudioBackend for NullAudioBackend {
     }
 
     fn set_sound_transform(&mut self, _instance: SoundInstanceHandle, _transform: SoundTransform) {}
+
+    fn volume(&self) -> f32 {
+        self.volume
+    }
+
+    fn set_volume(&mut self, volume: f32) {
+        self.volume = volume;
+    }
 }
 
 impl Default for NullAudioBackend {
@@ -248,6 +278,14 @@ impl<'gc> AudioManager<'gc> {
 
     /// The default timeline stream buffer time in seconds.
     pub const DEFAULT_STREAM_BUFFER_TIME: i32 = 5;
+
+    /// The threshold in seconds where an audio stream is considered too out-of-sync and will be stopped.
+    pub const STREAM_RESTART_THRESHOLD: f64 = 1.0;
+
+    /// The minimum audio sycning threshold in seconds.
+    ///
+    /// The player will adjust animation speed to stay within this many seconds of the audio track.
+    pub const STREAM_DEFAULT_SYNC_THRESHOLD: f64 = 0.2;
 
     pub fn new() -> Self {
         Self {
@@ -305,7 +343,7 @@ impl<'gc> AudioManager<'gc> {
                     action_queue.queue_actions(
                         root,
                         crate::context::ActionType::Event2 {
-                            event: Avm2Event::new("soundComplete"),
+                            event_type: "soundComplete",
                             target: object.into(),
                         },
                         false,
@@ -337,6 +375,7 @@ impl<'gc> AudioManager<'gc> {
                 transform: display_object::SoundTransform::default(),
                 avm1_object,
                 avm2_object: None,
+                stream_start_frame: None,
             };
             audio.set_sound_transform(handle, self.transform_for_sound(&instance));
             self.sounds.push(instance);
@@ -405,6 +444,10 @@ impl<'gc> AudioManager<'gc> {
         audio.stop_all_sounds();
     }
 
+    pub fn is_sound_playing(&mut self, sound: SoundInstanceHandle) -> bool {
+        self.sounds.iter().any(|other| other.instance == sound)
+    }
+
     pub fn is_sound_playing_with_handle(&mut self, sound: SoundHandle) -> bool {
         self.sounds.iter().any(|other| other.sound == Some(sound))
     }
@@ -429,12 +472,61 @@ impl<'gc> AudioManager<'gc> {
                 transform: display_object::SoundTransform::default(),
                 avm1_object: None,
                 avm2_object: None,
+                stream_start_frame: Some(clip_frame),
             };
             audio.set_sound_transform(handle, self.transform_for_sound(&instance));
             self.sounds.push(instance);
             Some(handle)
         } else {
             None
+        }
+    }
+
+    /// Returns the difference in seconds between the primary audio stream's time and the player's time.
+    pub fn audio_skew_time(&mut self, audio: &mut dyn AudioBackend, offset_ms: f64) -> f64 {
+        // Consider the first playing "stream" sound to be the primary audio track.
+        // Needs research: It's not clear how Flash handles the case of multiple stream sounds.
+        let (i, skew) = self
+            .sounds
+            .iter()
+            .enumerate()
+            .find_map(|(i, instance)| {
+                let start_frame = instance.stream_start_frame?;
+                let clip = instance
+                    .display_object
+                    .and_then(|clip| clip.as_movie_clip())?;
+                let stream_pos = audio.get_sound_position(instance.instance)?;
+                let frame_rate = clip.movie()?.frame_rate().to_f64();
+
+                // Calculate the difference in time between the owning movie clip and its audio track.
+                // If the difference is beyond some threshold, inform the player to adjust playback speed.
+                let timeline_pos = f64::from(clip.current_frame().saturating_sub(start_frame))
+                    / frame_rate
+                    + offset_ms / 1000.0;
+
+                Some((i, stream_pos / 1000.0 - timeline_pos))
+            })
+            .unwrap_or_default();
+
+        // Calculate the syncing threshold based on the audio backend's frequency in updating sound position.
+        let sync_threshold = audio
+            .position_resolution()
+            .map(|duration| duration.as_secs_f64())
+            .unwrap_or(Self::STREAM_DEFAULT_SYNC_THRESHOLD);
+
+        if skew.abs() >= Self::STREAM_RESTART_THRESHOLD {
+            // Way out of sync, let's stop the entire stream.
+            // The movie clip will probably restart it naturally on the next frame.
+            let instance = &self.sounds[i];
+            audio.stop_sound(instance.instance);
+            self.sounds.swap_remove(i);
+            0.0
+        } else if skew.abs() >= sync_threshold {
+            // Slightly out of sync, adjust player speed to compensate.
+            skew
+        } else {
+            // More or less in sync, no adjustment.
+            0.0
         }
     }
 
@@ -561,6 +653,8 @@ pub struct SoundInstance<'gc> {
 
     /// The AVM2 `SoundChannel` object associated with this sound, if any.
     avm2_object: Option<SoundChannelObject<'gc>>,
+
+    stream_start_frame: Option<u16>,
 }
 
 /// A sound transform for a playing sound, for use by audio backends.

@@ -25,13 +25,13 @@ const PROTO_DECLS: &[Declaration] = declare_properties! {
     "offsetPoint" => method(offset_point);
     "intersection" => method(intersection);
     "equals" => method(equals);
-    "left" => property(get_left, set_left; DONT_ENUM | DONT_DELETE);
-    "top" => property(get_top, set_top; DONT_ENUM | DONT_DELETE);
-    "right" => property(get_right, set_right; DONT_ENUM | DONT_DELETE);
-    "bottom" => property(get_bottom, set_bottom; DONT_ENUM | DONT_DELETE);
-    "size" => property(get_size, set_size; DONT_ENUM | DONT_DELETE);
-    "topLeft" => property(get_top_left, set_top_left; DONT_ENUM | DONT_DELETE);
-    "bottomRight" => property(get_bottom_right, set_bottom_right; DONT_ENUM | DONT_DELETE);
+    "left" => property(get_left, set_left);
+    "top" => property(get_top, set_top);
+    "right" => property(get_right, set_right);
+    "bottom" => property(get_bottom, set_bottom);
+    "size" => property(get_size, set_size);
+    "topLeft" => property(get_top_left, set_top_left);
+    "bottomRight" => property(get_bottom_right, set_bottom_right);
 };
 
 fn constructor<'gc>(
@@ -140,7 +140,7 @@ fn clone<'gc>(
         this.get("width", activation)?,
         this.get("height", activation)?,
     ];
-    let constructor = activation.context.avm1.prototypes.rectangle_constructor;
+    let constructor = activation.context.avm1.prototypes().rectangle_constructor;
     let cloned = constructor.construct(activation, &args)?;
     Ok(cloned)
 }
@@ -308,7 +308,7 @@ fn union<'gc>(
         this_bottom.max(other_bottom)
     } - top;
 
-    let constructor = activation.context.avm1.prototypes.rectangle_constructor;
+    let constructor = activation.context.avm1.prototypes().rectangle_constructor;
     let result = constructor.construct(
         activation,
         &[left.into(), top.into(), width.into(), height.into()],
@@ -458,7 +458,7 @@ fn intersection<'gc>(
         top = 0.0;
     }
 
-    let constructor = activation.context.avm1.prototypes.rectangle_constructor;
+    let constructor = activation.context.avm1.prototypes().rectangle_constructor;
     let result = constructor.construct(
         activation,
         &[
@@ -485,8 +485,8 @@ fn equals<'gc>(
         let other_y = other.get("y", activation)?;
         let other_width = other.get("width", activation)?;
         let other_height = other.get("height", activation)?;
-        let proto = activation.context.avm1.prototypes.rectangle;
-        let constructor = activation.context.avm1.prototypes.rectangle_constructor;
+        let proto = activation.context.avm1.prototypes().rectangle;
+        let constructor = activation.context.avm1.prototypes().rectangle_constructor;
         return Ok((this_x == other_x
             && this_y == other_y
             && this_width == other_width
@@ -708,7 +708,7 @@ pub fn create_proto<'gc>(
     proto: Object<'gc>,
     fn_proto: Object<'gc>,
 ) -> Object<'gc> {
-    let object = ScriptObject::object(gc_context, Some(proto));
+    let object = ScriptObject::new(gc_context, Some(proto));
     define_properties_on(PROTO_DECLS, gc_context, object, fn_proto);
     object.into()
 }

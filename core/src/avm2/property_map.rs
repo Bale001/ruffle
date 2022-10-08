@@ -1,7 +1,9 @@
 //! Property map
 
-use crate::avm2::names::{Multiname, Namespace, QName};
 use crate::avm2::AvmString;
+use crate::avm2::Multiname;
+use crate::avm2::Namespace;
+use crate::avm2::QName;
 use fnv::FnvBuildHasher;
 use gc_arena::{Collect, CollectionContext};
 use smallvec::SmallVec;
@@ -55,47 +57,41 @@ impl<'gc, V> PropertyMap<'gc, V> {
     }
 
     pub fn get(&self, name: QName<'gc>) -> Option<&V> {
-        self.0
-            .get(&name.local_name())
-            .iter()
-            .filter_map(|v| {
-                v.iter()
-                    .filter(|(n, _)| *n == name.namespace())
-                    .map(|(_, v)| v)
-                    .next()
-            })
-            .next()
+        self.0.get(&name.local_name()).iter().find_map(|v| {
+            v.iter()
+                .filter(|(n, _)| *n == name.namespace())
+                .map(|(_, v)| v)
+                .next()
+        })
     }
 
     pub fn get_for_multiname(&self, name: &Multiname<'gc>) -> Option<&V> {
+        if name.has_lazy_component() {
+            unreachable!("Lookup on lazy Multiname should never happen ({:?})", name);
+        }
         if let Some(local_name) = name.local_name() {
-            self.0
-                .get(&local_name)
-                .iter()
-                .filter_map(|v| {
-                    v.iter()
-                        .filter(|(n, _)| name.namespace_set().any(|ns| *ns == *n))
-                        .map(|(_, v)| v)
-                        .next()
-                })
-                .next()
+            self.0.get(&local_name).iter().find_map(|v| {
+                v.iter()
+                    .filter(|(n, _)| name.namespace_set().iter().any(|ns| *ns == *n))
+                    .map(|(_, v)| v)
+                    .next()
+            })
         } else {
             None
         }
     }
 
     pub fn get_with_ns_for_multiname(&self, name: &Multiname<'gc>) -> Option<(Namespace<'gc>, &V)> {
+        if name.has_lazy_component() {
+            unreachable!("Lookup on lazy Multiname should never happen ({:?})", name);
+        }
         if let Some(local_name) = name.local_name() {
-            self.0
-                .get(&local_name)
-                .iter()
-                .filter_map(|v| {
-                    v.iter()
-                        .filter(|(n, _)| name.namespace_set().any(|ns| *ns == *n))
-                        .map(|(ns, v)| (*ns, v))
-                        .next()
-                })
-                .next()
+            self.0.get(&local_name).iter().find_map(|v| {
+                v.iter()
+                    .filter(|(n, _)| name.namespace_set().iter().any(|ns| *ns == *n))
+                    .map(|(ns, v)| (*ns, v))
+                    .next()
+            })
         } else {
             None
         }

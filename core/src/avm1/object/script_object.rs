@@ -1,14 +1,13 @@
 use crate::avm1::activation::Activation;
 use crate::avm1::error::Error;
 use crate::avm1::function::{ExecutionName, ExecutionReason};
+use crate::avm1::object::NativeObject;
 use crate::avm1::property::{Attribute, Property};
 use crate::avm1::property_map::{Entry, PropertyMap};
 use crate::avm1::{Object, ObjectPtr, TObject, Value};
 use crate::string::AvmString;
 use core::fmt;
 use gc_arena::{Collect, GcCell, MutationContext};
-
-pub const TYPE_OF_OBJECT: &str = "object";
 
 #[derive(Debug, Clone, Collect)]
 #[collect(no_drop)]
@@ -38,7 +37,7 @@ impl<'gc> Watcher<'gc> {
         exec.exec(
             ExecutionName::Dynamic(name),
             activation,
-            this,
+            this.into(),
             0,
             &args,
             ExecutionReason::Special,
@@ -54,9 +53,9 @@ pub struct ScriptObject<'gc>(GcCell<'gc, ScriptObjectData<'gc>>);
 #[derive(Collect)]
 #[collect(no_drop)]
 pub struct ScriptObjectData<'gc> {
+    native: NativeObject<'gc>,
     properties: PropertyMap<'gc, Property<'gc>>,
     interfaces: Vec<Object<'gc>>,
-    type_of: &'static str,
     watchers: PropertyMap<'gc, Watcher<'gc>>,
 }
 
@@ -70,11 +69,11 @@ impl fmt::Debug for ScriptObjectData<'_> {
 }
 
 impl<'gc> ScriptObject<'gc> {
-    pub fn object(gc_context: MutationContext<'gc, '_>, proto: Option<Object<'gc>>) -> Self {
+    pub fn new(gc_context: MutationContext<'gc, '_>, proto: Option<Object<'gc>>) -> Self {
         let object = Self(GcCell::allocate(
             gc_context,
             ScriptObjectData {
-                type_of: TYPE_OF_OBJECT,
+                native: NativeObject::None,
                 properties: PropertyMap::new(),
                 interfaces: vec![],
                 watchers: PropertyMap::new(),
@@ -89,27 +88,6 @@ impl<'gc> ScriptObject<'gc> {
             );
         }
         object
-    }
-
-    /// Constructs and allocates an empty but normal object in one go.
-    pub fn object_cell(
-        gc_context: MutationContext<'gc, '_>,
-        proto: Option<Object<'gc>>,
-    ) -> Object<'gc> {
-        Self::object(gc_context, proto).into()
-    }
-
-    /// Constructs an object with no properties, not even builtins.
-    ///
-    /// Intended for constructing scope chains, since they exclusively use the
-    /// object properties, but can't just have a hashmap because of `with` and
-    /// friends.
-    pub fn bare_object(gc_context: MutationContext<'gc, '_>) -> Self {
-        Self::object(gc_context, None)
-    }
-
-    pub fn set_type_of(&mut self, gc_context: MutationContext<'gc, '_>, type_of: &'static str) {
-        self.0.write(gc_context).type_of = type_of;
     }
 
     /// Gets the value of a data property on this object.
@@ -150,6 +128,22 @@ impl<'gc> ScriptObject<'gc> {
         }
         Ok(())
     }
+
+    // TODO: Make an iterator?
+    pub fn own_properties(&self) -> Vec<(AvmString<'gc>, Value<'gc>)> {
+        self.0
+            .read()
+            .properties
+            .iter()
+            .filter_map(|(k, p)| {
+                if p.is_enumerable() {
+                    Some((k, p.data()))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
 }
 
 impl<'gc> TObject<'gc> for ScriptObject<'gc> {
@@ -163,6 +157,7 @@ impl<'gc> TObject<'gc> for ScriptObject<'gc> {
             .read()
             .properties
             .get(name.into(), activation.is_case_sensitive())
+            .filter(|property| property.allow_swf_version(activation.swf_version()))
             .map(|property| property.data())
     }
 
@@ -196,7 +191,7 @@ impl<'gc> TObject<'gc> for ScriptObject<'gc> {
                 if let Err(Error::ThrownValue(e)) = exec.exec(
                     ExecutionName::Static("[Setter]"),
                     activation,
-                    this,
+                    this.into(),
                     1,
                     &[value],
                     ExecutionReason::Special,
@@ -219,7 +214,7 @@ impl<'gc> TObject<'gc> for ScriptObject<'gc> {
         &self,
         _name: AvmString<'gc>,
         _activation: &mut Activation<'_, 'gc, '_>,
-        _this: Object<'gc>,
+        _this: Value<'gc>,
         _args: &[Value<'gc>],
     ) -> Result<Value<'gc>, Error<'gc>> {
         Ok(Value::Undefined)
@@ -234,6 +229,7 @@ impl<'gc> TObject<'gc> for ScriptObject<'gc> {
             .read()
             .properties
             .get(name, activation.is_case_sensitive())
+            .filter(|property| property.allow_swf_version(activation.swf_version()))
             .and_then(|property| property.getter())
     }
 
@@ -246,6 +242,7 @@ impl<'gc> TObject<'gc> for ScriptObject<'gc> {
             .read()
             .properties
             .get(name, activation.is_case_sensitive())
+            .filter(|property| property.allow_swf_version(activation.swf_version()))
             .and_then(|property| property.setter())
     }
 
@@ -254,7 +251,7 @@ impl<'gc> TObject<'gc> for ScriptObject<'gc> {
         activation: &mut Activation<'_, 'gc, '_>,
         this: Object<'gc>,
     ) -> Result<Object<'gc>, Error<'gc>> {
-        Ok(ScriptObject::object(activation.context.gc_context, Some(this)).into())
+        Ok(ScriptObject::new(activation.context.gc_context, Some(this)).into())
     }
 
     /// Delete a named property from the object.
@@ -433,7 +430,9 @@ impl<'gc> TObject<'gc> for ScriptObject<'gc> {
             .read()
             .properties
             .get(name, activation.is_case_sensitive())
-            .map_or(false, |property| property.is_virtual())
+            .map_or(false, |property| {
+                property.is_virtual() && property.allow_swf_version(activation.swf_version())
+            })
     }
 
     /// Checks if a named property appears when enumerating the object.
@@ -477,16 +476,26 @@ impl<'gc> TObject<'gc> for ScriptObject<'gc> {
         out_keys
     }
 
-    fn type_of(&self) -> &'static str {
-        self.0.read().type_of
-    }
-
     fn interfaces(&self) -> Vec<Object<'gc>> {
         self.0.read().interfaces.clone()
     }
 
     fn set_interfaces(&self, gc_context: MutationContext<'gc, '_>, iface_list: Vec<Object<'gc>>) {
         self.0.write(gc_context).interfaces = iface_list;
+    }
+
+    fn native(&self) -> NativeObject<'gc> {
+        self.0.read().native.clone()
+    }
+
+    fn set_native(&self, gc_context: MutationContext<'gc, '_>, native: NativeObject<'gc>) {
+        // Native object should be introduced at most once.
+        debug_assert!(matches!(self.0.read().native, NativeObject::None));
+
+        // Native object must not be `None`.
+        debug_assert!(!matches!(native, NativeObject::None));
+
+        self.0.write(gc_context).native = native;
     }
 
     fn as_script_object(&self) -> Option<ScriptObject<'gc>> {
@@ -541,107 +550,21 @@ mod tests {
     use super::*;
 
     use crate::avm1::function::Executable;
-    use crate::avm1::globals::system::SystemProperties;
+    use crate::avm1::function::FunctionObject;
     use crate::avm1::property::Attribute;
-    use crate::avm1::{activation::ActivationIdentifier, function::FunctionObject};
-    use crate::avm1::{Avm1, Timers};
-    use crate::avm2::Avm2;
-    use crate::backend::audio::{AudioManager, NullAudioBackend};
-    use crate::backend::locale::NullLocaleBackend;
-    use crate::backend::log::NullLogBackend;
-    use crate::backend::navigator::NullNavigatorBackend;
-    use crate::backend::render::NullRenderer;
-    use crate::backend::storage::MemoryStorageBackend;
-    use crate::backend::ui::NullUiBackend;
-    use crate::backend::video::NullVideoBackend;
-    use crate::context::UpdateContext;
-    use crate::display_object::{MovieClip, Stage};
-    use crate::focus_tracker::FocusTracker;
-    use crate::library::Library;
-    use crate::loader::LoadManager;
-    use crate::prelude::*;
-    use crate::tag_utils::SwfMovie;
-    use crate::vminterface::Instantiator;
-    use gc_arena::rootless_arena;
-    use instant::Instant;
-    use rand::{rngs::SmallRng, SeedableRng};
-    use std::collections::HashMap;
-    use std::sync::Arc;
-    use std::time::Duration;
 
-    fn with_object<F, R>(swf_version: u8, test: F) -> R
+    fn with_object<F>(swf_version: u8, test: F)
     where
-        F: for<'a, 'gc> FnOnce(&mut Activation<'_, 'gc, '_>, Object<'gc>) -> R,
+        F: for<'a, 'gc> FnOnce(&mut Activation<'_, 'gc, '_>, Object<'gc>),
     {
-        rootless_arena(|gc_context| {
-            let mut avm1 = Avm1::new(gc_context, swf_version);
-            let mut avm2 = Avm2::new(gc_context);
-            let swf = Arc::new(SwfMovie::empty(swf_version));
-            let root: DisplayObject<'_> = MovieClip::new(swf.clone(), gc_context).into();
-            root.set_depth(gc_context, 0);
-
-            let stage = Stage::empty(gc_context, 550, 400);
-            let mut frame_rate = 12.0;
-
-            let object = ScriptObject::object(gc_context, Some(avm1.prototypes().object)).into();
-            let globals = avm1.global_object_cell();
-
-            let mut context = UpdateContext {
-                gc_context,
-                player_version: 32,
-                swf: &swf,
-                stage,
-                rng: &mut SmallRng::from_seed([0u8; 32]),
-                action_queue: &mut crate::context::ActionQueue::new(),
-                audio: &mut NullAudioBackend::new(),
-                audio_manager: &mut AudioManager::new(),
-                ui: &mut NullUiBackend::new(),
-                library: &mut Library::empty(gc_context),
-                navigator: &mut NullNavigatorBackend::new(),
-                renderer: &mut NullRenderer::new(),
-                locale: &mut NullLocaleBackend::new(),
-                log: &mut NullLogBackend::new(),
-                video: &mut NullVideoBackend::new(),
-                mouse_over_object: None,
-                mouse_down_object: None,
-                input: &Default::default(),
-                mouse_position: &(Twips::ZERO, Twips::ZERO),
-                drag_object: &mut None,
-                player: None,
-                load_manager: &mut LoadManager::new(),
-                system: &mut SystemProperties::default(),
-                instance_counter: &mut 0,
-                storage: &mut MemoryStorageBackend::default(),
-                shared_objects: &mut HashMap::new(),
-                unbound_text_fields: &mut Vec::new(),
-                timers: &mut Timers::new(),
-                current_context_menu: &mut None,
-                needs_render: &mut false,
-                avm1: &mut avm1,
-                avm2: &mut avm2,
-                external_interface: &mut Default::default(),
-                update_start: Instant::now(),
-                max_execution_duration: Duration::from_secs(15),
-                focus_tracker: FocusTracker::new(gc_context),
-                times_get_time_called: 0,
-                time_offset: &mut 0,
-                frame_rate: &mut frame_rate,
-            };
-            context.stage.replace_at_depth(&mut context, root, 0);
-
-            root.post_instantiation(&mut context, root, None, Instantiator::Movie, false);
-            root.set_name(context.gc_context, "".into());
-
-            let swf_version = context.swf.version();
-            let mut activation = Activation::from_nothing(
-                context,
-                ActivationIdentifier::root("[Test]"),
-                swf_version,
-                globals,
-                root,
-            );
-
-            test(&mut activation, object)
+        crate::avm1::test_utils::with_avm(swf_version, |activation, _root| {
+            let object = ScriptObject::new(
+                activation.context.gc_context,
+                Some(activation.context.avm1.prototypes().object),
+            )
+            .into();
+            test(activation, object);
+            Ok(())
         })
     }
 
@@ -731,7 +654,7 @@ mod tests {
                 activation.context.gc_context,
                 Executable::Native(|_avm, _this, _args| Ok("Virtual!".into())),
                 None,
-                activation.context.avm1.prototypes.function,
+                activation.context.avm1.prototypes().function,
             );
 
             object.as_script_object().unwrap().add_property(
@@ -757,7 +680,7 @@ mod tests {
                 activation.context.gc_context,
                 Executable::Native(|_avm, _this, _args| Ok("Virtual!".into())),
                 None,
-                activation.context.avm1.prototypes.function,
+                activation.context.avm1.prototypes().function,
             );
 
             object.as_script_object().unwrap().add_property(
@@ -813,7 +736,7 @@ mod tests {
                 activation.context.gc_context,
                 Executable::Native(|_avm, _this, _args| Ok(Value::Null)),
                 None,
-                activation.context.avm1.prototypes.function,
+                activation.context.avm1.prototypes().function,
             );
 
             object.as_script_object().unwrap().define_value(

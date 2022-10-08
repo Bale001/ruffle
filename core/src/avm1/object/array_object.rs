@@ -1,6 +1,7 @@
 use crate::avm1::property::Attribute;
-use crate::avm1::{Activation, AvmString, Error, Object, ObjectPtr, ScriptObject, TObject, Value};
+use crate::avm1::{Activation, Error, Object, ObjectPtr, ScriptObject, TObject, Value};
 use crate::ecma_conversions::f64_to_wrapping_i32;
+use crate::string::AvmString;
 use gc_arena::{Collect, GcCell, MutationContext};
 use std::fmt;
 
@@ -40,7 +41,7 @@ impl<'gc> ArrayObject<'gc> {
         proto: Object<'gc>,
         elements: impl IntoIterator<Item = Value<'gc>>,
     ) -> Self {
-        let base = ScriptObject::object(gc_context, Some(proto));
+        let base = ScriptObject::new(gc_context, Some(proto));
         let mut length: i32 = 0;
         for value in elements.into_iter() {
             let length_str = AvmString::new_utf8(gc_context, length.to_string());
@@ -99,7 +100,7 @@ impl<'gc> TObject<'gc> for ArrayObject<'gc> {
         &self,
         name: AvmString<'gc>,
         activation: &mut Activation<'_, 'gc, '_>,
-        this: Object<'gc>,
+        this: Value<'gc>,
         args: &[Value<'gc>],
     ) -> Result<Value<'gc>, Error<'gc>> {
         self.0.read().call(name, activation, this, args)
@@ -241,10 +242,6 @@ impl<'gc> TObject<'gc> for ArrayObject<'gc> {
 
     fn get_keys(&self, activation: &mut Activation<'_, 'gc, '_>) -> Vec<AvmString<'gc>> {
         self.0.read().get_keys(activation)
-    }
-
-    fn type_of(&self) -> &'static str {
-        self.0.read().type_of()
     }
 
     fn interfaces(&self) -> Vec<Object<'gc>> {

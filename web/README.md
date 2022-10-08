@@ -48,15 +48,17 @@ For the compiler to be able to output WebAssembly, an additional target has to b
 
 #### Node.js
 
-Follow the instructions [to install node.js](https://nodejs.org/en/) on your machine.
+Follow the instructions to [install Node.js](https://nodejs.org/) on your machine.
 
-We recommend using the currently active LTS 16, but we do also run tests with maintenance LTS 14.
+We recommend using the currently active LTS 16, but we do also run tests with current Node.js 18.
+
+Note that npm 7 or newer is required. It should come bundled with Node.js 15 or newer, but can be upgraded with older Node.js versions using `npm install -g npm` as root/Administrator.
 
 #### wasm-bindgen
 
 <!-- Be sure to also update the wasm-bindgen-cli version in `.github/workflows/*.yml` and `web/Cargo.toml`. -->
 
-This can be installed with `cargo install wasm-bindgen-cli --version 0.2.78`. Be sure to install this specific version of `wasm-bindgen-cli` to match the version used by Ruffle.
+This can be installed with `cargo install wasm-bindgen-cli --version 0.2.82`. Be sure to install this specific version of `wasm-bindgen-cli` to match the version used by Ruffle.
 
 #### Binaryen
 
@@ -75,17 +77,18 @@ Just make sure the `wasm-opt` program is in `$PATH`, and that it works.
 
 In this project, you may run the following commands to build all packages:
 
--   `npm run bootstrap`
+-   `npm install`
     -   This will install every dependency for every package.
     -   Run this every time you pull in new changes, otherwise you may be missing a package and the build will fail.
 -   `npm run build`
     -   This will build the wasm binary and every node package (notably selfhosted and extension).
-    -   Output will be available in the `dist/` of each package (for example, `./packages/selfhosted/dist`),
-        save for the extension which is directory `build/`.
+    -   Output will be available in the `dist/` folder of each package (for example, `./packages/selfhosted/dist`).
     -   You may also use `npm run build:debug` to disable Webpack optimizations and activate the (extremely verbose) ActionScript debugging output.
+    -   There is `npm run build:dual-wasm` as well, to build a second WebAssembly module that makes use of some WebAssembly extensions,
+        potentially resulting in better performance in browsers that support them, at the expense of longer build time.
 
 From here, you may follow the instructions to [use Ruffle on your website](packages/selfhosted/README.md),
-or run a demo locally with `npm run demo`.
+run a demo locally with `npm run demo`, or [install the extension in your browser](https://github.com/ruffle-rs/ruffle/wiki/Using-Ruffle#browser-extension).
 
 ### Testing
 

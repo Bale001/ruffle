@@ -5,10 +5,10 @@ use crate::drawing::Drawing;
 use crate::font::{EvalParameters, Font};
 use crate::html::dimensions::{BoxBounds, Position, Size};
 use crate::html::text_format::{FormatSpans, TextFormat, TextSpan};
-use crate::shape_utils::DrawCommand;
 use crate::string::{utils as string_utils, WStr};
 use crate::tag_utils::SwfMovie;
 use gc_arena::Collect;
+use ruffle_render::shape_utils::DrawCommand;
 use std::cmp::{max, min};
 use std::sync::Arc;
 use swf::Twips;
@@ -145,10 +145,11 @@ impl<'a, 'gc> LayoutContext<'a, 'gc> {
         let mut line_drawing = Drawing::new();
         let mut has_underline: bool = false;
 
-        line_drawing.set_line_style(Some(swf::LineStyle::new_v1(
-            Twips::new(1),
-            swf::Color::from_rgb(0, 255),
-        )));
+        line_drawing.set_line_style(Some(
+            swf::LineStyle::new()
+                .with_width(Twips::new(1))
+                .with_color(swf::Color::BLACK),
+        ));
 
         if let Some(linelist) = self.boxes.get(self.current_line..) {
             for linebox in linelist {
@@ -278,8 +279,7 @@ impl<'a, 'gc> LayoutContext<'a, 'gc> {
         } else {
             self.font_leading_adjustment()
         };
-
-        if self.current_line_span.bullet && self.is_first_line {
+        if self.current_line_span.bullet && self.is_first_line && box_count > 0 {
             self.append_bullet(context, &self.current_line_span.clone());
         }
 

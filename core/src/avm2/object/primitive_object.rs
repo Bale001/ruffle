@@ -13,10 +13,9 @@ use gc_arena::{Collect, GcCell, MutationContext};
 /// A class instance allocator that allocates primitive objects.
 pub fn primitive_allocator<'gc>(
     class: ClassObject<'gc>,
-    proto: Object<'gc>,
     activation: &mut Activation<'_, 'gc, '_>,
-) -> Result<Object<'gc>, Error> {
-    let base = ScriptObjectData::base_new(Some(proto), Some(class));
+) -> Result<Object<'gc>, Error<'gc>> {
+    let base = ScriptObjectData::new(class);
 
     Ok(PrimitiveObject(GcCell::allocate(
         activation.context.gc_context,
@@ -54,7 +53,7 @@ impl<'gc> PrimitiveObject<'gc> {
     pub fn from_primitive(
         primitive: Value<'gc>,
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<Object<'gc>, Error> {
+    ) -> Result<Object<'gc>, Error<'gc>> {
         if !primitive.is_primitive() {
             return Err("Attempted to box an object as a primitive".into());
         }
@@ -65,24 +64,15 @@ impl<'gc> PrimitiveObject<'gc> {
             return Err("Cannot box a null value".into());
         }
 
-        let proto = match primitive {
-            Value::Bool(_) => activation.avm2().prototypes().boolean,
-            Value::Number(_) => activation.avm2().prototypes().number,
-            Value::Unsigned(_) => activation.avm2().prototypes().uint,
-            Value::Integer(_) => activation.avm2().prototypes().int,
-            Value::String(_) => activation.avm2().prototypes().string,
-            _ => unreachable!(),
-        };
         let class = match primitive {
             Value::Bool(_) => activation.avm2().classes().boolean,
             Value::Number(_) => activation.avm2().classes().number,
-            Value::Unsigned(_) => activation.avm2().classes().uint,
             Value::Integer(_) => activation.avm2().classes().int,
             Value::String(_) => activation.avm2().classes().string,
             _ => unreachable!(),
         };
 
-        let base = ScriptObjectData::base_new(Some(proto), Some(class));
+        let base = ScriptObjectData::new(class);
         let mut this: Object<'gc> = PrimitiveObject(GcCell::allocate(
             activation.context.gc_context,
             PrimitiveObjectData { base, primitive },
@@ -112,40 +102,36 @@ impl<'gc> TObject<'gc> for PrimitiveObject<'gc> {
         self.0.as_ptr() as *const ObjectPtr
     }
 
-    fn to_string(&self, _mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error> {
+    fn to_string(
+        &self,
+        _activation: &mut Activation<'_, 'gc, '_>,
+    ) -> Result<Value<'gc>, Error<'gc>> {
         Ok(self.0.read().primitive)
     }
 
-    fn to_locale_string(&self, mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error> {
+    fn to_locale_string(
+        &self,
+        activation: &mut Activation<'_, 'gc, '_>,
+    ) -> Result<Value<'gc>, Error<'gc>> {
         match self.0.read().primitive {
-            val @ Value::Integer(_) | val @ Value::Unsigned(_) => Ok(val),
+            val @ Value::Integer(_) => Ok(val),
             _ => {
                 let class_name = self
                     .instance_of_class_definition()
                     .map(|c| c.read().name().local_name())
                     .unwrap_or_else(|| "Object".into());
 
-                Ok(AvmString::new_utf8(mc, format!("[object {}]", class_name)).into())
+                Ok(AvmString::new_utf8(
+                    activation.context.gc_context,
+                    format!("[object {}]", class_name),
+                )
+                .into())
             }
         }
     }
 
-    fn value_of(&self, _mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error> {
+    fn value_of(&self, _mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error<'gc>> {
         Ok(self.0.read().primitive)
-    }
-
-    fn derive(&self, activation: &mut Activation<'_, 'gc, '_>) -> Result<Object<'gc>, Error> {
-        let this: Object<'gc> = Object::PrimitiveObject(*self);
-        let base = ScriptObjectData::base_new(Some(this), None);
-
-        Ok(PrimitiveObject(GcCell::allocate(
-            activation.context.gc_context,
-            PrimitiveObjectData {
-                base,
-                primitive: Value::Undefined,
-            },
-        ))
-        .into())
     }
 
     fn as_primitive_mut(&self, mc: MutationContext<'gc, '_>) -> Option<RefMut<Value<'gc>>> {

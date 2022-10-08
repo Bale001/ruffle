@@ -1,17 +1,19 @@
 //! AVM2 methods
 
 use crate::avm2::activation::Activation;
-use crate::avm2::names::Multiname;
 use crate::avm2::object::Object;
 use crate::avm2::script::TranslationUnit;
 use crate::avm2::value::{abc_default_value, Value};
 use crate::avm2::Error;
+use crate::avm2::Multiname;
 use crate::string::AvmString;
 use gc_arena::{Collect, CollectionContext, Gc, MutationContext};
 use std::fmt;
+use std::ops::Deref;
 use std::rc::Rc;
 use swf::avm2::types::{
-    AbcFile, Index, Method as AbcMethod, MethodBody as AbcMethodBody, MethodParam as AbcMethodParam,
+    AbcFile, Index, Method as AbcMethod, MethodBody as AbcMethodBody,
+    MethodFlags as AbcMethodFlags, MethodParam as AbcMethodParam,
 };
 
 /// Represents a function defined in Ruffle's code.
@@ -32,7 +34,7 @@ pub type NativeMethodImpl = for<'gc> fn(
     &mut Activation<'_, 'gc, '_>,
     Option<Object<'gc>>,
     &[Value<'gc>],
-) -> Result<Value<'gc>, Error>;
+) -> Result<Value<'gc>, Error<'gc>>;
 
 /// Configuration of a single parameter of a method.
 #[derive(Clone, Collect, Debug)]
@@ -53,21 +55,17 @@ impl<'gc> ParamConfig<'gc> {
         config: &AbcMethodParam,
         txunit: TranslationUnit<'gc>,
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, Error<'gc>> {
         let param_name = if let Some(name) = &config.name {
             txunit.pool_string(name.0, activation.context.gc_context)?
         } else {
             "<Unnamed Parameter>".into()
         };
-        let param_type_name = if config.kind.0 == 0 {
-            Multiname::any()
-        } else {
-            Multiname::from_abc_multiname_static(
-                txunit,
-                config.kind,
-                activation.context.gc_context,
-            )?
-        };
+        let param_type_name = txunit
+            .pool_multiname_static_any(config.kind, activation.context.gc_context)?
+            .deref()
+            .clone();
+
         let default_value = if let Some(dv) = &config.default_value {
             Some(abc_default_value(txunit, dv, activation)?)
         } else {
@@ -139,7 +137,7 @@ impl<'gc> BytecodeMethod<'gc> {
         abc_method: Index<AbcMethod>,
         is_function: bool,
         activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<Gc<'gc, Self>, Error> {
+    ) -> Result<Self, Error<'gc>> {
         let abc = txunit.abc();
         let mut signature = Vec::new();
 
@@ -149,46 +147,35 @@ impl<'gc> BytecodeMethod<'gc> {
                 signature.push(ParamConfig::from_abc_param(param, txunit, activation)?);
             }
 
-            let return_type = if method.return_type.0 == 0 {
-                Multiname::any()
-            } else {
-                Multiname::from_abc_multiname_static(
-                    txunit,
-                    method.return_type,
-                    activation.context.gc_context,
-                )?
-            };
+            let return_type = txunit
+                .pool_multiname_static_any(method.return_type, activation.context.gc_context)?
+                .deref()
+                .clone();
 
             for (index, method_body) in abc.method_bodies.iter().enumerate() {
                 if method_body.method.0 == abc_method.0 {
-                    return Ok(Gc::allocate(
-                        activation.context.gc_context,
-                        Self {
-                            txunit,
-                            abc: txunit.abc(),
-                            abc_method: abc_method.0,
-                            abc_method_body: Some(index as u32),
-                            signature,
-                            return_type,
-                            is_function,
-                        },
-                    ));
+                    return Ok(Self {
+                        txunit,
+                        abc: txunit.abc(),
+                        abc_method: abc_method.0,
+                        abc_method_body: Some(index as u32),
+                        signature,
+                        return_type,
+                        is_function,
+                    });
                 }
             }
         }
 
-        Ok(Gc::allocate(
-            activation.context.gc_context,
-            Self {
-                txunit,
-                abc: txunit.abc(),
-                abc_method: abc_method.0,
-                abc_method_body: None,
-                signature,
-                return_type: Multiname::any(),
-                is_function,
-            },
-        ))
+        Ok(Self {
+            txunit,
+            abc: txunit.abc(),
+            abc_method: abc_method.0,
+            abc_method_body: None,
+            signature,
+            return_type: Multiname::any(),
+            is_function,
+        })
     }
 
     /// Get the underlying ABC file.
@@ -241,7 +228,9 @@ impl<'gc> BytecodeMethod<'gc> {
     ///
     /// Variadic methods shove excess parameters into a final register.
     pub fn is_variadic(&self) -> bool {
-        self.method().needs_arguments_object || self.method().needs_rest
+        self.method()
+            .flags
+            .intersects(AbcMethodFlags::NEED_ARGUMENTS | AbcMethodFlags::NEED_REST)
     }
 
     /// Determine if a given method is unchecked.
@@ -251,7 +240,6 @@ impl<'gc> BytecodeMethod<'gc> {
     ///  * The method was declared as a free-standing function
     ///  * The function does not use rest-parameters
     ///  * The function's parameters have no declared types or default values
-    ///  * The function does not declare a return type
     pub fn is_unchecked(&self) -> bool {
         if !self.is_function {
             return false;
@@ -263,7 +251,7 @@ impl<'gc> BytecodeMethod<'gc> {
             }
         }
 
-        !self.method().needs_rest && self.return_type.is_any()
+        !self.method().flags.contains(AbcMethodFlags::NEED_REST)
     }
 }
 
@@ -359,7 +347,7 @@ impl<'gc> Method<'gc> {
     /// Access the bytecode of this method.
     ///
     /// This function returns `Err` if there is no bytecode for this method.
-    pub fn into_bytecode(self) -> Result<Gc<'gc, BytecodeMethod<'gc>>, Error> {
+    pub fn into_bytecode(self) -> Result<Gc<'gc, BytecodeMethod<'gc>>, Error<'gc>> {
         match self {
             Method::Native { .. } => {
                 Err("Attempted to unwrap a native method as a user-defined one".into())
@@ -372,7 +360,7 @@ impl<'gc> Method<'gc> {
     pub fn needs_arguments_object(&self) -> bool {
         match self {
             Method::Native { .. } => false,
-            Method::Bytecode(bm) => bm.method().needs_arguments_object,
+            Method::Bytecode(bm) => bm.method().flags.contains(AbcMethodFlags::NEED_ARGUMENTS),
         }
     }
 }

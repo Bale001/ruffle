@@ -1,8 +1,9 @@
 //! Container mix-in for display objects
 
-use crate::avm2::{Avm2, Event as Avm2Event, Value as Avm2Value};
+use crate::avm2::{Avm2, EventObject as Avm2EventObject, Value as Avm2Value};
 use crate::context::{RenderContext, UpdateContext};
 use crate::display_object::avm1_button::Avm1Button;
+use crate::display_object::loader_display::LoaderDisplay;
 use crate::display_object::movie_clip::MovieClip;
 use crate::display_object::stage::Stage;
 use crate::display_object::{Depth, DisplayObject, TDisplayObject};
@@ -10,10 +11,11 @@ use crate::string::WStr;
 use bitflags::bitflags;
 use gc_arena::{Collect, MutationContext};
 use ruffle_macros::enum_trait_object;
+use ruffle_render::commands::CommandHandler;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
-use std::ops::{Bound, RangeBounds};
+use std::ops::RangeBounds;
 
 /// Dispatch the `removedFromStage` event on a child and all of it's
 /// grandchildren, recursively.
@@ -22,9 +24,7 @@ pub fn dispatch_removed_from_stage_event<'gc>(
     context: &mut UpdateContext<'_, 'gc, '_>,
 ) {
     if let Avm2Value::Object(object) = child.object2() {
-        let mut removed_evt = Avm2Event::new("removedFromStage");
-        removed_evt.set_bubbles(false);
-        removed_evt.set_cancelable(false);
+        let removed_evt = Avm2EventObject::bare_default_event(context, "removedFromStage");
 
         if let Err(e) = Avm2::dispatch_event(context, removed_evt, object) {
             log::error!("Encountered AVM2 error when dispatching event: {}", e);
@@ -45,9 +45,7 @@ pub fn dispatch_removed_event<'gc>(
     context: &mut UpdateContext<'_, 'gc, '_>,
 ) {
     if let Avm2Value::Object(object) = child.object2() {
-        let mut removed_evt = Avm2Event::new("removed");
-        removed_evt.set_bubbles(true);
-        removed_evt.set_cancelable(false);
+        let removed_evt = Avm2EventObject::bare_event(context, "removed", true, false);
 
         if let Err(e) = Avm2::dispatch_event(context, removed_evt, object) {
             log::error!("Encountered AVM2 error when dispatching event: {}", e);
@@ -65,11 +63,9 @@ pub fn dispatch_added_to_stage_event_only<'gc>(
     context: &mut UpdateContext<'_, 'gc, '_>,
 ) {
     if let Avm2Value::Object(object) = child.object2() {
-        let mut removed_evt = Avm2Event::new("addedToStage");
-        removed_evt.set_bubbles(false);
-        removed_evt.set_cancelable(false);
+        let added_evt = Avm2EventObject::bare_default_event(context, "addedToStage");
 
-        if let Err(e) = Avm2::dispatch_event(context, removed_evt, object) {
+        if let Err(e) = Avm2::dispatch_event(context, added_evt, object) {
             log::error!("Encountered AVM2 error when dispatching event: {}", e);
         }
     }
@@ -97,11 +93,9 @@ pub fn dispatch_added_event_only<'gc>(
     context: &mut UpdateContext<'_, 'gc, '_>,
 ) {
     if let Avm2Value::Object(object) = child.object2() {
-        let mut removed_evt = Avm2Event::new("added");
-        removed_evt.set_bubbles(true);
-        removed_evt.set_cancelable(false);
+        let added_evt = Avm2EventObject::bare_event(context, "added", true, false);
 
-        if let Err(e) = Avm2::dispatch_event(context, removed_evt, object) {
+        if let Err(e) = Avm2::dispatch_event(context, added_evt, object) {
             log::error!("Encountered AVM2 error when dispatching event: {}", e);
         }
     }
@@ -150,6 +144,7 @@ bitflags! {
         Stage(Stage<'gc>),
         Avm1Button(Avm1Button<'gc>),
         MovieClip(MovieClip<'gc>),
+        LoaderDisplay(LoaderDisplay<'gc>),
     }
 )]
 pub trait TDisplayObjectContainer<'gc>:
@@ -180,13 +175,8 @@ pub trait TDisplayObjectContainer<'gc>:
     /// Returns the number of children on the render list.
     fn num_children(self) -> usize;
 
-    /// Returns the highest depth on the render list, or `None` if no children
-    /// have a depth less than the provided value.
-    fn highest_depth(self, less_than: Depth) -> Option<Depth>;
-
-    /// Returns the lowest depth on the render list, or `None` if no children
-    /// have a depth greater than the provided value.
-    fn lowest_depth(self, greater_than: Depth) -> Option<Depth>;
+    /// Returns the highest depth among children.
+    fn highest_depth(self) -> Depth;
 
     /// Insert a child display object into the container at a specific position
     /// in the depth list, removing any child already at that position.
@@ -288,25 +278,14 @@ pub trait TDisplayObjectContainer<'gc>:
         RenderIter::from_container(self.into())
     }
 
-    /// Iterates over the children of this display object in depth order.
-    ///
-    /// This yields an iterator that does *not* lock the parent and can be
-    /// safely held in situations where display objects need to be unlocked.
-    /// This means that unexpected but legal and defined items may be yielded
-    /// due to intended or unintended list manipulation by the caller.
-    ///
-    /// The iterator's concrete type is stated here due to Rust language
-    /// limitations.
-    fn iter_depth_list(self) -> DepthIter<'gc> {
-        DepthIter::from_container(self.into())
-    }
-
     /// Renders the children of this container in render list order.
-    fn render_children(self, context: &mut RenderContext<'_, 'gc>) {
+    fn render_children(self, context: &mut RenderContext<'_, 'gc, '_>) {
         let mut clip_depth = 0;
         let mut clip_depth_stack: Vec<(Depth, DisplayObject<'_>)> = vec![];
         for child in self.iter_render_list() {
             let depth = child.depth();
+
+            child.pre_render(context);
 
             // Check if we need to pop off a mask.
             // This must be a while loop because multiple masks can be popped
@@ -315,21 +294,21 @@ pub trait TDisplayObjectContainer<'gc>:
                 // Clear the mask stencil and pop the mask.
                 let (prev_clip_depth, clip_child) = clip_depth_stack.pop().unwrap();
                 clip_depth = prev_clip_depth;
-                context.renderer.deactivate_mask();
+                context.commands.deactivate_mask();
                 context.allow_mask = false;
                 clip_child.render(context);
                 context.allow_mask = true;
-                context.renderer.pop_mask();
+                context.commands.pop_mask();
             }
             if context.allow_mask && child.clip_depth() > 0 && child.allow_as_mask() {
                 // Push and render the mask.
                 clip_depth_stack.push((clip_depth, child));
                 clip_depth = child.clip_depth();
-                context.renderer.push_mask();
+                context.commands.push_mask();
                 context.allow_mask = false;
                 child.render(context);
                 context.allow_mask = true;
-                context.renderer.activate_mask();
+                context.commands.activate_mask();
             } else if child.visible() {
                 // Normal child.
                 child.render(context);
@@ -338,11 +317,11 @@ pub trait TDisplayObjectContainer<'gc>:
 
         // Pop any remaining masks.
         for (_, clip_child) in clip_depth_stack.into_iter().rev() {
-            context.renderer.deactivate_mask();
+            context.commands.deactivate_mask();
             context.allow_mask = false;
             clip_child.render(context);
             context.allow_mask = true;
-            context.renderer.pop_mask();
+            context.commands.pop_mask();
         }
     }
 }
@@ -360,7 +339,7 @@ macro_rules! impl_display_object_container {
 
         fn child_by_name(
             self,
-            name: &crate::string::WStr,
+            name: &$crate::string::WStr,
             case_sensitive: bool,
         ) -> Option<DisplayObject<'gc>> {
             self.0.read().$field.get_name(name, case_sensitive)
@@ -370,12 +349,8 @@ macro_rules! impl_display_object_container {
             self.0.read().$field.num_children()
         }
 
-        fn highest_depth(self, less_than: Depth) -> Option<Depth> {
-            self.0.read().$field.highest_depth(less_than)
-        }
-
-        fn lowest_depth(self, greater_than: Depth) -> Option<Depth> {
-            self.0.read().$field.lowest_depth(greater_than)
+        fn highest_depth(self) -> Depth {
+            self.0.read().$field.highest_depth()
         }
 
         fn replace_at_depth(
@@ -466,7 +441,7 @@ macro_rules! impl_display_object_container {
             child: DisplayObject<'gc>,
             index: usize,
         ) {
-            use crate::display_object::container::dispatch_added_event;
+            use $crate::display_object::container::dispatch_added_event;
             let parent_changed = if let Some(old_parent) = child.parent() {
                 if !DisplayObject::ptr_eq(old_parent, (*self).into()) {
                     if let Some(mut old_parent) = old_parent.as_container() {
@@ -485,6 +460,7 @@ macro_rules! impl_display_object_container {
 
             child.set_place_frame(context.gc_context, 0);
             child.set_parent(context.gc_context, Some((*self).into()));
+            child.set_removed(context.gc_context, false);
 
             self.0
                 .write(context.gc_context)
@@ -524,7 +500,7 @@ macro_rules! impl_display_object_container {
                 (*self).into()
             ));
 
-            use crate::display_object::container::dispatch_removed_event;
+            use $crate::display_object::container::dispatch_removed_event;
             dispatch_removed_event(child, context);
 
             let mut write = self.0.write(context.gc_context);
@@ -564,7 +540,7 @@ macro_rules! impl_display_object_container {
                 .map(|(_, child)| child)
                 .collect();
 
-            use crate::display_object::container::dispatch_removed_event;
+            use $crate::display_object::container::dispatch_removed_event;
             for removed in removed_list.iter() {
                 dispatch_removed_event(*removed, context);
             }
@@ -588,7 +564,7 @@ macro_rules! impl_display_object_container {
         }
 
         fn clear(&mut self, context: &mut UpdateContext<'_, 'gc, '_>) {
-            use crate::display_object::container::dispatch_removed_event;
+            use $crate::display_object::container::dispatch_removed_event;
             let removed_children: Vec<DisplayObject<'gc>> =
                 self.0.read().$field.iter_render_list().collect();
             for removed in removed_children {
@@ -694,23 +670,9 @@ impl<'gc> ChildContainer<'gc> {
         }
     }
 
-    /// Returns the highest depth on the render list, or `None` if no children
-    /// have a depth less than the provided value.
-    pub fn highest_depth(&self, less_than: Depth) -> Option<Depth> {
-        self.depth_list
-            .range(..less_than)
-            .rev()
-            .map(|(k, _v)| *k)
-            .next()
-    }
-
-    /// Returns the lowest depth on the render list, or `None` if no children
-    /// have a depth greater than the provided value.
-    pub fn lowest_depth(&self, greater_than: Depth) -> Option<Depth> {
-        self.depth_list
-            .range((Bound::Excluded(greater_than), Bound::<Depth>::Unbounded))
-            .map(|(k, _v)| *k)
-            .next()
+    /// Returns the highest depth among children.
+    pub fn highest_depth(&self) -> Depth {
+        self.depth_list.keys().next_back().copied().unwrap_or(0)
     }
 
     /// Determine if the render list is empty.
@@ -728,20 +690,19 @@ impl<'gc> ChildContainer<'gc> {
     /// The `case_sensitive` parameter determines if we should consider
     /// children with different capitalizations as being distinct names.
     ///
-    /// If multiple children with the same name exist, the one with the lowest
-    /// depth wins. Children not on the depth list will not be accessible via
-    /// this mechanism.
+    /// If multiple children with the same name exist, the one that occurs
+    /// first in the render list wins.
     pub fn get_name(&self, name: &WStr, case_sensitive: bool) -> Option<DisplayObject<'gc>> {
         // TODO: Make a HashMap from name -> child?
         // But need to handle conflicting names (lowest in depth order takes priority).
         if case_sensitive {
-            self.depth_list
-                .values()
+            self.render_list
+                .iter()
                 .copied()
                 .find(|child| child.name() == name)
         } else {
-            self.depth_list
-                .values()
+            self.render_list
+                .iter()
                 .copied()
                 .find(|child| child.name().eq_ignore_case(name))
         }
@@ -949,76 +910,5 @@ impl<'gc> DoubleEndedIterator for RenderIter<'gc> {
         self.neg_i -= 1;
 
         this
-    }
-}
-
-pub struct DepthIter<'gc> {
-    src: DisplayObjectContainer<'gc>,
-    depth: Option<Depth>,
-    neg_depth: Option<Depth>,
-}
-
-impl<'gc> DepthIter<'gc> {
-    fn from_container(src: DisplayObjectContainer<'gc>) -> Self {
-        Self {
-            src,
-            depth: Some(Depth::MIN),
-            neg_depth: Some(Depth::MAX),
-        }
-    }
-}
-
-impl<'gc> Iterator for DepthIter<'gc> {
-    type Item = (Depth, DisplayObject<'gc>);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.depth.is_none()
-            || self.neg_depth.is_none()
-            || self.depth.unwrap() > self.neg_depth.unwrap()
-        {
-            return None;
-        }
-
-        let mut old_depth = self.depth.unwrap();
-        let (new_depth, new_next) = if let Some(next) = self.src.child_by_depth(old_depth) {
-            (self.src.lowest_depth(old_depth), Some(next))
-        } else if let Some(new_depth) = self.src.lowest_depth(old_depth) {
-            old_depth = new_depth;
-            (
-                self.src.lowest_depth(new_depth),
-                self.src.child_by_depth(new_depth),
-            )
-        } else {
-            (None, None)
-        };
-
-        self.depth = new_depth;
-
-        new_next.map(|n| (old_depth, n))
-    }
-}
-
-impl<'gc> DoubleEndedIterator for DepthIter<'gc> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        if self.depth.is_none() || self.neg_depth.is_none() || self.neg_depth <= self.depth {
-            return None;
-        }
-
-        let mut old_neg_depth = self.neg_depth.unwrap();
-        let (new_neg_depth, new_next) = if let Some(next) = self.src.child_by_depth(old_neg_depth) {
-            (self.src.highest_depth(old_neg_depth), Some(next))
-        } else if let Some(new_neg_depth) = self.src.highest_depth(old_neg_depth) {
-            old_neg_depth = new_neg_depth;
-            (
-                self.src.highest_depth(new_neg_depth),
-                self.src.child_by_depth(new_neg_depth),
-            )
-        } else {
-            (None, None)
-        };
-
-        self.neg_depth = new_neg_depth;
-
-        new_next.map(|n| (old_neg_depth, n))
     }
 }

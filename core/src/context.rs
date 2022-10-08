@@ -1,35 +1,35 @@
 //! Contexts and helper types passed between functions.
 
-use crate::avm1::globals::system::SystemProperties;
-use crate::avm1::{Avm1, Object as Avm1Object, Timers, Value as Avm1Value};
-use crate::avm2::{
-    Avm2, Event as Avm2Event, Object as Avm2Object, SoundChannelObject, Value as Avm2Value,
-};
+use crate::avm1::Avm1;
+use crate::avm1::SystemProperties;
+use crate::avm1::{Object as Avm1Object, Value as Avm1Value};
+use crate::avm2::{Avm2, Object as Avm2Object, SoundChannelObject, Value as Avm2Value};
 use crate::backend::{
     audio::{AudioBackend, AudioManager, SoundHandle, SoundInstanceHandle},
-    locale::LocaleBackend,
     log::LogBackend,
     navigator::NavigatorBackend,
-    render::RenderBackend,
     storage::StorageBackend,
     ui::{InputManager, UiBackend},
-    video::VideoBackend,
 };
 use crate::context_menu::ContextMenuState;
-use crate::display_object::{EditText, MovieClip, SoundTransform, Stage};
+use crate::display_object::{EditText, InteractiveObject, MovieClip, SoundTransform, Stage};
 use crate::external::ExternalInterface;
 use crate::focus_tracker::FocusTracker;
+use crate::frame_lifecycle::FramePhase;
 use crate::library::Library;
 use crate::loader::LoadManager;
 use crate::player::Player;
 use crate::prelude::*;
 use crate::tag_utils::{SwfMovie, SwfSlice};
-use crate::transform::TransformStack;
-use crate::vminterface::AvmType;
+use crate::timer::Timers;
 use core::fmt;
 use gc_arena::{Collect, MutationContext};
 use instant::Instant;
 use rand::rngs::SmallRng;
+use ruffle_render::backend::RenderBackend;
+use ruffle_render::commands::CommandList;
+use ruffle_render::transform::TransformStack;
+use ruffle_video::backend::VideoBackend;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -80,9 +80,6 @@ pub struct UpdateContext<'a, 'gc, 'gc_context> {
     /// The storage backend, used for storing persistent state
     pub storage: &'a mut dyn StorageBackend,
 
-    /// The locale backend, used for localisation and personalisation
-    pub locale: &'a mut dyn LocaleBackend,
-
     /// The logging backend, used for trace output capturing.
     ///
     /// **DO NOT** use this field directly, use the `avm_trace` method instead.
@@ -98,10 +95,10 @@ pub struct UpdateContext<'a, 'gc, 'gc_context> {
     pub stage: Stage<'gc>,
 
     /// The display object that the mouse is currently hovering over.
-    pub mouse_over_object: Option<DisplayObject<'gc>>,
+    pub mouse_over_object: Option<InteractiveObject<'gc>>,
 
     /// If the mouse is down, the display object that the mouse is currently pressing.
-    pub mouse_down_object: Option<DisplayObject<'gc>>,
+    pub mouse_down_object: Option<InteractiveObject<'gc>>,
 
     /// The input manager, tracking keys state.
     pub input: &'a InputManager,
@@ -116,7 +113,7 @@ pub struct UpdateContext<'a, 'gc, 'gc_context> {
     ///
     /// Recipients of an update context may upgrade the reference to ensure
     /// that the player lives across I/O boundaries.
-    pub player: Option<Weak<Mutex<Player>>>,
+    pub player: Weak<Mutex<Player>>,
 
     /// The player's load manager.
     ///
@@ -131,7 +128,10 @@ pub struct UpdateContext<'a, 'gc, 'gc_context> {
     pub instance_counter: &'a mut i32,
 
     /// Shared objects cache
-    pub shared_objects: &'a mut HashMap<String, Avm1Object<'gc>>,
+    pub avm1_shared_objects: &'a mut HashMap<String, Avm1Object<'gc>>,
+
+    /// Shared objects cache
+    pub avm2_shared_objects: &'a mut HashMap<String, Avm2Object<'gc>>,
 
     /// Text fields with unbound variable bindings.
     pub unbound_text_fields: &'a mut Vec<EditText<'gc>>,
@@ -149,6 +149,9 @@ pub struct UpdateContext<'a, 'gc, 'gc_context> {
 
     /// External interface for (for example) JavaScript <-> ActionScript interaction
     pub external_interface: &'a mut ExternalInterface<'gc>,
+
+    /// The instant at which the SWF was launched.
+    pub start_time: Instant,
 
     /// The instant at which the current update started.
     pub update_start: Instant,
@@ -168,6 +171,14 @@ pub struct UpdateContext<'a, 'gc, 'gc_context> {
 
     /// The current stage frame rate.
     pub frame_rate: &'a mut f64,
+
+    /// Amount of actions performed since the last timeout check
+    pub actions_since_timeout_check: &'a mut u16,
+
+    /// The current frame processing phase.
+    ///
+    /// If we are not doing frame processing, then this is `FramePhase::Enter`.
+    pub frame_phase: &'a mut FramePhase,
 }
 
 /// Convenience methods for controlling audio.
@@ -243,6 +254,10 @@ impl<'a, 'gc, 'gc_context> UpdateContext<'a, 'gc, 'gc_context> {
         self.audio_manager.stop_all_sounds(self.audio)
     }
 
+    pub fn is_sound_playing(&mut self, sound: SoundInstanceHandle) -> bool {
+        self.audio_manager.is_sound_playing(sound)
+    }
+
     pub fn is_sound_playing_with_handle(&mut self, sound: SoundHandle) -> bool {
         self.audio_manager.is_sound_playing_with_handle(sound)
     }
@@ -293,7 +308,6 @@ impl<'a, 'gc, 'gc_context> UpdateContext<'a, 'gc, 'gc_context> {
             audio_manager: self.audio_manager,
             navigator: self.navigator,
             renderer: self.renderer,
-            locale: self.locale,
             log: self.log,
             ui: self.ui,
             video: self.video,
@@ -309,25 +323,28 @@ impl<'a, 'gc, 'gc_context> UpdateContext<'a, 'gc, 'gc_context> {
             load_manager: self.load_manager,
             system: self.system,
             instance_counter: self.instance_counter,
-            shared_objects: self.shared_objects,
+            avm1_shared_objects: self.avm1_shared_objects,
+            avm2_shared_objects: self.avm2_shared_objects,
             unbound_text_fields: self.unbound_text_fields,
             timers: self.timers,
             current_context_menu: self.current_context_menu,
             avm1: self.avm1,
             avm2: self.avm2,
             external_interface: self.external_interface,
+            start_time: self.start_time,
             update_start: self.update_start,
             max_execution_duration: self.max_execution_duration,
             focus_tracker: self.focus_tracker,
             times_get_time_called: self.times_get_time_called,
             time_offset: self.time_offset,
             frame_rate: self.frame_rate,
+            actions_since_timeout_check: self.actions_since_timeout_check,
+            frame_phase: self.frame_phase,
         }
     }
 
-    /// Return the VM that this object belongs to
-    pub fn avm_type(&self) -> AvmType {
-        self.swf.avm_type()
+    pub fn is_action_script_3(&self) -> bool {
+        self.swf.is_action_script_3()
     }
 
     pub fn avm_trace(&self, message: &str) {
@@ -411,9 +428,16 @@ impl<'gc> Default for ActionQueue<'gc> {
 
 /// Shared data used during rendering.
 /// `Player` creates this when it renders a frame and passes it down to display objects.
-pub struct RenderContext<'a, 'gc> {
-    /// The renderer, used by the display objects to draw themselves.
+pub struct RenderContext<'a, 'gc, 'gc_context> {
+    /// The renderer, used by the display objects to register themselves.
     pub renderer: &'a mut dyn RenderBackend,
+
+    /// The command list, used by the display objects to draw themselves.
+    pub commands: &'a mut CommandList,
+
+    /// The GC MutationContext, used to perform any GcCell writes
+    /// that must occur during rendering.
+    pub gc_context: MutationContext<'gc, 'gc_context>,
 
     /// The UI backend, used to detect user interactions.
     pub ui: &'a mut dyn UiBackend,
@@ -423,6 +447,9 @@ pub struct RenderContext<'a, 'gc> {
 
     /// The transform stack controls the matrix and color transform as we traverse the display hierarchy.
     pub transform_stack: &'a mut TransformStack,
+
+    /// Whether we're rendering offscreen. This can disable some logic like Ruffle-side render culling
+    pub is_offscreen: bool,
 
     /// The current player's stage (including all loaded levels)
     pub stage: Stage<'gc>,
@@ -472,9 +499,10 @@ pub enum ActionType<'gc> {
         args: Vec<Avm2Value<'gc>>,
     },
 
-    /// An AVM2 event to be dispatched.
+    /// An AVM2 event to be dispatched. This translates to an Event class instance.
+    /// Creating an Event subclass via this dispatch is TODO.
     Event2 {
-        event: Avm2Event<'gc>,
+        event_type: &'static str,
         target: Avm2Object<'gc>,
     },
 }
@@ -534,9 +562,9 @@ impl fmt::Debug for ActionType<'_> {
                 .field("reciever", reciever)
                 .field("args", args)
                 .finish(),
-            ActionType::Event2 { event, target } => f
+            ActionType::Event2 { event_type, target } => f
                 .debug_struct("ActionType::Event2")
-                .field("event", event)
+                .field("event_type", event_type)
                 .field("target", target)
                 .finish(),
         }

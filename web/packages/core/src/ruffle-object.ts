@@ -1,17 +1,16 @@
 import {
-    FLASH_MIMETYPE,
-    FUTURESPLASH_MIMETYPE,
-    FLASH7_AND_8_MIMETYPE,
-    FLASH_MOVIE_MIMETYPE,
     FLASH_ACTIVEX_CLASSID,
     isBuiltInContextMenuVisible,
     isFallbackElement,
     isScriptAccessAllowed,
     isSwfFilename,
+    isSwfMimeType,
+    isYoutubeFlashSource,
+    workaroundYoutubeMixedContent,
     RufflePlayer,
 } from "./ruffle-player";
 import { registerElement } from "./register-element";
-import { URLLoadOptions } from "./load-options";
+import type { URLLoadOptions, WindowMode } from "./load-options";
 import { RuffleEmbed } from "./ruffle-embed";
 
 /**
@@ -43,7 +42,7 @@ function findCaseInsensitive(
  * @param elem Element to check.
  * @returns A record of every parameter.
  */
-function paramsOf(elem: HTMLElement): Record<string, string> {
+function paramsOf(elem: Element): Record<string, string> {
     const params: Record<string, string> = {};
 
     for (const param of elem.children) {
@@ -124,6 +123,7 @@ export class RuffleObject extends RufflePlayer {
         const salign = findCaseInsensitive(this.params, "salign", "");
         const quality = findCaseInsensitive(this.params, "quality", "high");
         const scale = findCaseInsensitive(this.params, "scale", "showAll");
+        const wmode = findCaseInsensitive(this.params, "wmode", "window");
 
         if (url) {
             const options: URLLoadOptions = { url };
@@ -149,6 +149,9 @@ export class RuffleObject extends RufflePlayer {
             }
             if (scale) {
                 options.scale = scale;
+            }
+            if (wmode) {
+                options.wmode = wmode as WindowMode;
             }
 
             // Kick off the SWF download.
@@ -199,7 +202,7 @@ export class RuffleObject extends RufflePlayer {
      * @internal
      */
     set data(href: string | null) {
-        if (href != undefined) {
+        if (href) {
             const attr = document.createAttribute("data");
             attr.value = href;
             this.attributes.setNamedItem(attr);
@@ -214,13 +217,16 @@ export class RuffleObject extends RufflePlayer {
      * @param elem Element to check.
      * @returns True if the element looks like a flash object.
      */
-    static isInterdictable(elem: HTMLElement): boolean {
+    static isInterdictable(elem: Element): boolean {
         // Don't polyfill if the element is inside a specific node.
         if (isFallbackElement(elem)) {
             return false;
         }
-        // Don't polyfill if there's already a <ruffle-embed> inside the <object>.
-        if (elem.getElementsByTagName("ruffle-embed").length > 0) {
+        // Don't polyfill if there's already a <ruffle-object> or a <ruffle-embed> inside the <object>.
+        if (
+            elem.getElementsByTagName("ruffle-object").length > 0 ||
+            elem.getElementsByTagName("ruffle-embed").length > 0
+        ) {
             return false;
         }
 
@@ -230,8 +236,29 @@ export class RuffleObject extends RufflePlayer {
         let isSwf;
         // Check for SWF file.
         if (data) {
+            // Don't polyfill when the file is a Youtube Flash source.
+            if (isYoutubeFlashSource(data)) {
+                // Workaround YouTube mixed content; this isn't what browsers do automatically, but while we're here, we may as well
+                workaroundYoutubeMixedContent(elem, "data");
+                return false;
+            }
             isSwf = isSwfFilename(data);
         } else if (params && params.movie) {
+            // Don't polyfill when the file is a Youtube Flash source.
+            if (isYoutubeFlashSource(params.movie)) {
+                // Workaround YouTube mixed content; this isn't what browsers do automatically, but while we're here, we may as well
+                const movie_elem = elem.querySelector("param[name='movie']");
+                if (movie_elem) {
+                    workaroundYoutubeMixedContent(movie_elem, "value");
+                    // The data attribute needs to be set for the re-fetch to happen
+                    // It also needs to be set on Firefox for the YouTube object rewrite to work, regardless of mixed content
+                    const movie_src = movie_elem.getAttribute("value");
+                    if (movie_src) {
+                        elem.setAttribute("data", movie_src);
+                    }
+                }
+                return false;
+            }
             isSwf = isSwfFilename(params.movie);
         } else {
             // Don't polyfill when no file is specified.
@@ -245,30 +272,29 @@ export class RuffleObject extends RufflePlayer {
         if (classid === FLASH_ACTIVEX_CLASSID.toLowerCase()) {
             // classid is an old-IE style embed that would not work on modern browsers.
             // Often there will be an <embed> inside the <object> that would take precedence.
-            // Only polyfill this <object> if it doesn't contain a polyfillable <embed>.
-            return !Array.from(elem.getElementsByTagName("embed")).some(
-                RuffleEmbed.isInterdictable
+            // Only polyfill this <object> if it doesn't contain a polyfillable <embed> or
+            // another <object> that would be supported on modern browsers.
+            return (
+                !Array.from(elem.getElementsByTagName("object")).some(
+                    RuffleObject.isInterdictable
+                ) &&
+                !Array.from(elem.getElementsByTagName("embed")).some(
+                    RuffleEmbed.isInterdictable
+                )
             );
-        } else if (classid != null && classid !== "") {
+        } else if (classid) {
             // Non-Flash classid.
             return false;
         }
 
         // Check for MIME type.
-        const type = elem.attributes.getNamedItem("type")?.value.toLowerCase();
-        if (
-            type === FLASH_MIMETYPE.toLowerCase() ||
-            type === FUTURESPLASH_MIMETYPE.toLowerCase() ||
-            type === FLASH7_AND_8_MIMETYPE.toLowerCase() ||
-            type === FLASH_MOVIE_MIMETYPE.toLowerCase()
-        ) {
-            return true;
-        } else if (type != null && type !== "") {
-            return false;
+        const type = elem.attributes.getNamedItem("type");
+        if (!type) {
+            // If no MIME type is specified, polyfill if movie is an SWF file.
+            return isSwf;
+        } else {
+            return isSwfMimeType(type.value);
         }
-
-        // If no MIME/class type is specified, polyfill if movie is an SWF file.
-        return isSwf;
     }
 
     /**
@@ -277,7 +303,7 @@ export class RuffleObject extends RufflePlayer {
      * @param elem Element to replace.
      * @returns Created RuffleObject.
      */
-    static fromNativeObjectElement(elem: HTMLElement): RuffleObject {
+    static fromNativeObjectElement(elem: Element): RuffleObject {
         const externalName = registerElement("ruffle-object", RuffleObject);
         const ruffleObj: RuffleObject = <RuffleObject>(
             document.createElement(externalName)

@@ -3,48 +3,31 @@
 use crate::cli_options::ExecuteReportOpt;
 use crate::file_results::{AvmType, FileResults, Step};
 use crate::logging::{ScanLogBackend, ThreadLocalScanLogger, LOCAL_LOGGER};
-use ruffle_core::backend::audio::NullAudioBackend;
-use ruffle_core::backend::locale::NullLocaleBackend;
 use ruffle_core::backend::navigator::{NullExecutor, NullNavigatorBackend};
-use ruffle_core::backend::render::NullRenderer;
-use ruffle_core::backend::storage::MemoryStorageBackend;
-use ruffle_core::backend::ui::NullUiBackend;
-use ruffle_core::backend::video::NullVideoBackend;
+use ruffle_core::limits::ExecutionLimit;
 use ruffle_core::swf::{decompress_swf, parse_swf};
 use ruffle_core::tag_utils::SwfMovie;
-use ruffle_core::Player;
+use ruffle_core::PlayerBuilder;
 use sha2::{Digest, Sha256};
-
-use std::path::Path;
-
-use std::panic::catch_unwind;
-
 use std::io::{stdout, Write};
-use std::sync::Arc;
+use std::panic::catch_unwind;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 fn execute_swf(file: &Path) {
     let base_path = file.parent().unwrap();
-    let (_executor, channel) = NullExecutor::new();
+    let executor = NullExecutor::new();
     let movie = SwfMovie::from_path(file, None).unwrap();
     let frame_time = 1000.0 / movie.frame_rate().to_f64();
-    let player = Player::new(
-        Box::new(NullRenderer::new()),
-        Box::new(NullAudioBackend::new()),
-        Box::new(NullNavigatorBackend::with_base_path(base_path, channel)),
-        Box::new(MemoryStorageBackend::default()),
-        Box::new(NullLocaleBackend::new()),
-        Box::new(NullVideoBackend::new()),
-        Box::new(ScanLogBackend::new()),
-        Box::new(NullUiBackend::new()),
-    )
-    .unwrap();
+    let player = PlayerBuilder::new()
+        .with_log(ScanLogBackend::new())
+        .with_navigator(NullNavigatorBackend::with_base_path(base_path, &executor))
+        .with_max_execution_duration(Duration::from_secs(300))
+        .with_movie(movie)
+        .build();
 
-    player.lock().unwrap().set_root_movie(Arc::new(movie));
-    player
-        .lock()
-        .unwrap()
-        .set_max_execution_duration(Duration::from_secs(300));
+    player.lock().unwrap().preload(&mut ExecutionLimit::none());
+
     player.lock().unwrap().run_frame();
     player.lock().unwrap().update_timers(frame_time);
     //executor.poll_all().unwrap();

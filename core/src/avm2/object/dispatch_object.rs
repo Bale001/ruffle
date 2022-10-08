@@ -51,7 +51,8 @@ pub struct DispatchObjectData<'gc> {
 impl<'gc> DispatchObject<'gc> {
     /// Construct an empty dispatch list.
     pub fn empty_list(mc: MutationContext<'gc, '_>) -> Object<'gc> {
-        let base = ScriptObjectData::base_new(None, None);
+        // TODO: we might want this to be a proper Object instance, just in case
+        let base = ScriptObjectData::custom_new(None, None);
 
         DispatchObject(GcCell::allocate(
             mc,
@@ -81,15 +82,11 @@ impl<'gc> TObject<'gc> for DispatchObject<'gc> {
         self,
         _activation: &mut Activation<'_, 'gc, '_>,
         _args: &[Value<'gc>],
-    ) -> Result<Object<'gc>, Error> {
+    ) -> Result<Object<'gc>, Error<'gc>> {
         Err("Cannot construct internal event dispatcher structures.".into())
     }
 
-    fn derive(&self, _activation: &mut Activation<'_, 'gc, '_>) -> Result<Object<'gc>, Error> {
-        Err("Cannot subclass internal event dispatcher structures.".into())
-    }
-
-    fn value_of(&self, _mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error> {
+    fn value_of(&self, _mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error<'gc>> {
         Err("Cannot subclass internal event dispatcher structures.".into())
     }
 

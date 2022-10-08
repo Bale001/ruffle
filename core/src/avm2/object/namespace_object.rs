@@ -1,21 +1,20 @@
 //! Boxed namespaces
 
 use crate::avm2::activation::Activation;
-use crate::avm2::names::Namespace;
 use crate::avm2::object::script_object::ScriptObjectData;
 use crate::avm2::object::{ClassObject, Object, ObjectPtr, TObject};
 use crate::avm2::value::Value;
 use crate::avm2::Error;
+use crate::avm2::Namespace;
 use gc_arena::{Collect, GcCell, MutationContext};
 use std::cell::{Ref, RefMut};
 
 /// A class instance allocator that allocates namespace objects.
 pub fn namespace_allocator<'gc>(
     class: ClassObject<'gc>,
-    proto: Object<'gc>,
     activation: &mut Activation<'_, 'gc, '_>,
-) -> Result<Object<'gc>, Error> {
-    let base = ScriptObjectData::base_new(Some(proto), Some(class));
+) -> Result<Object<'gc>, Error<'gc>> {
+    let base = ScriptObjectData::new(class);
 
     Ok(NamespaceObject(GcCell::allocate(
         activation.context.gc_context,
@@ -47,10 +46,9 @@ impl<'gc> NamespaceObject<'gc> {
     pub fn from_namespace(
         activation: &mut Activation<'_, 'gc, '_>,
         namespace: Namespace<'gc>,
-    ) -> Result<Object<'gc>, Error> {
+    ) -> Result<Object<'gc>, Error<'gc>> {
         let class = activation.avm2().classes().namespace;
-        let proto = activation.avm2().prototypes().namespace;
-        let base = ScriptObjectData::base_new(Some(proto), Some(class));
+        let base = ScriptObjectData::new(class);
 
         let mut this: Object<'gc> = NamespaceObject(GcCell::allocate(
             activation.context.gc_context,
@@ -78,29 +76,18 @@ impl<'gc> TObject<'gc> for NamespaceObject<'gc> {
         self.0.as_ptr() as *const ObjectPtr
     }
 
-    fn to_string(&self, _mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error> {
+    fn to_string(
+        &self,
+        _activation: &mut Activation<'_, 'gc, '_>,
+    ) -> Result<Value<'gc>, Error<'gc>> {
         Ok(self.0.read().namespace.as_uri().into())
     }
 
-    fn value_of(&self, _mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error> {
+    fn value_of(&self, _mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error<'gc>> {
         Ok(self.0.read().namespace.as_uri().into())
     }
 
     fn as_namespace(&self) -> Option<Ref<Namespace<'gc>>> {
         Some(Ref::map(self.0.read(), |s| &s.namespace))
-    }
-
-    fn derive(&self, activation: &mut Activation<'_, 'gc, '_>) -> Result<Object<'gc>, Error> {
-        let this: Object<'gc> = Object::NamespaceObject(*self);
-        let base = ScriptObjectData::base_new(Some(this), None);
-
-        Ok(NamespaceObject(GcCell::allocate(
-            activation.context.gc_context,
-            NamespaceObjectData {
-                base,
-                namespace: Namespace::public(),
-            },
-        ))
-        .into())
     }
 }

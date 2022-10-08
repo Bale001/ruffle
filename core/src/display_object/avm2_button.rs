@@ -12,6 +12,7 @@ use crate::display_object::interactive::{
 };
 use crate::display_object::{DisplayObjectBase, DisplayObjectPtr, MovieClip, TDisplayObject};
 use crate::events::{ClipEvent, ClipEventResult};
+use crate::frame_lifecycle::catchup_display_object_to_frame;
 use crate::prelude::*;
 use crate::tag_utils::{SwfMovie, SwfSlice};
 use crate::vminterface::Instantiator;
@@ -195,13 +196,13 @@ impl<'gc> Avm2Button<'gc> {
                     .instantiate_by_id(record.id, context.gc_context)
                 {
                     Ok(child) => {
-                        child.set_matrix(context.gc_context, &record.matrix.into());
+                        child.set_matrix(context.gc_context, record.matrix.into());
                         child.set_depth(context.gc_context, record.depth.into());
 
                         if swf_state != swf::ButtonState::HIT_TEST {
                             child.set_color_transform(
                                 context.gc_context,
-                                &record.color_transform.clone().into(),
+                                record.color_transform.clone().into(),
                             );
                         }
 
@@ -223,8 +224,8 @@ impl<'gc> Avm2Button<'gc> {
             let child = children.first().cloned().unwrap().0;
 
             child.set_parent(context.gc_context, Some(self.into()));
-            child.post_instantiation(context, child, None, Instantiator::Movie, false);
-            child.construct_frame(context);
+            child.post_instantiation(context, None, Instantiator::Movie, false);
+            catchup_display_object_to_frame(context, child);
 
             (child, false)
         } else {
@@ -232,7 +233,7 @@ impl<'gc> Avm2Button<'gc> {
 
             state_sprite.set_avm2_class(context.gc_context, Some(sprite_class));
             state_sprite.set_parent(context.gc_context, Some(self.into()));
-            state_sprite.construct_frame(context);
+            catchup_display_object_to_frame(context, state_sprite.into());
 
             for (child, depth) in children {
                 // `parent` returns `null` for these grandchildren during construction time, even though
@@ -241,8 +242,8 @@ impl<'gc> Avm2Button<'gc> {
                 // and then properly set the parent to the state Sprite afterwards.
                 state_sprite.replace_at_depth(context, child, depth.into());
                 child.set_parent(context.gc_context, Some(self.into()));
-                child.post_instantiation(context, child, None, Instantiator::Movie, false);
-                child.construct_frame(context);
+                child.post_instantiation(context, None, Instantiator::Movie, false);
+                catchup_display_object_to_frame(context, child);
                 child.set_parent(context.gc_context, Some(state_sprite.into()));
             }
 
@@ -415,7 +416,6 @@ impl<'gc> TDisplayObject<'gc> for Avm2Button<'gc> {
     fn post_instantiation(
         &self,
         context: &mut UpdateContext<'_, 'gc, '_>,
-        _display_object: DisplayObject<'gc>,
         _init_object: Option<Avm1Object<'gc>>,
         _instantiated_by: Instantiator,
         run_frame: bool,
@@ -427,6 +427,28 @@ impl<'gc> TDisplayObject<'gc> for Avm2Button<'gc> {
         }
 
         self.set_state(context, ButtonState::Up);
+    }
+
+    fn enter_frame(&self, context: &mut UpdateContext<'_, 'gc, '_>) {
+        let hit_area = self.0.read().hit_area;
+        if let Some(hit_area) = hit_area {
+            hit_area.enter_frame(context);
+        }
+
+        let up_state = self.0.read().up_state;
+        if let Some(up_state) = up_state {
+            up_state.enter_frame(context);
+        }
+
+        let down_state = self.0.read().down_state;
+        if let Some(down_state) = down_state {
+            down_state.enter_frame(context);
+        }
+
+        let over_state = self.0.read().over_state;
+        if let Some(over_state) = over_state {
+            over_state.enter_frame(context);
+        }
     }
 
     fn construct_frame(&self, context: &mut UpdateContext<'_, 'gc, '_>) {
@@ -479,52 +501,40 @@ impl<'gc> TDisplayObject<'gc> for Avm2Button<'gc> {
             drop(write);
 
             if up_should_fire {
-                up_state.post_instantiation(context, up_state, None, Instantiator::Movie, false);
+                up_state.post_instantiation(context, None, Instantiator::Movie, false);
 
                 if let Some(up_container) = up_state.as_container() {
-                    for (_depth, child) in up_container.iter_depth_list() {
+                    for child in up_container.iter_render_list() {
                         dispatch_added_event((*self).into(), child, false, context);
                     }
                 }
             }
 
             if over_should_fire {
-                over_state.post_instantiation(
-                    context,
-                    over_state,
-                    None,
-                    Instantiator::Movie,
-                    false,
-                );
+                over_state.post_instantiation(context, None, Instantiator::Movie, false);
 
                 if let Some(over_container) = over_state.as_container() {
-                    for (_depth, child) in over_container.iter_depth_list() {
+                    for child in over_container.iter_render_list() {
                         dispatch_added_event((*self).into(), child, false, context);
                     }
                 }
             }
 
             if down_should_fire {
-                down_state.post_instantiation(
-                    context,
-                    down_state,
-                    None,
-                    Instantiator::Movie,
-                    false,
-                );
+                down_state.post_instantiation(context, None, Instantiator::Movie, false);
 
                 if let Some(down_container) = down_state.as_container() {
-                    for (_depth, child) in down_container.iter_depth_list() {
+                    for child in down_container.iter_render_list() {
                         dispatch_added_event((*self).into(), child, false, context);
                     }
                 }
             }
 
             if hit_should_fire {
-                hit_area.post_instantiation(context, hit_area, None, Instantiator::Movie, false);
+                hit_area.post_instantiation(context, None, Instantiator::Movie, false);
 
                 if let Some(hit_container) = hit_area.as_container() {
-                    for (_depth, child) in hit_container.iter_depth_list() {
+                    for child in hit_container.iter_render_list() {
                         dispatch_added_event((*self).into(), child, false, context);
                     }
                 }
@@ -619,7 +629,7 @@ impl<'gc> TDisplayObject<'gc> for Avm2Button<'gc> {
         }
     }
 
-    fn render_self(&self, context: &mut RenderContext<'_, 'gc>) {
+    fn render_self(&self, context: &mut RenderContext<'_, 'gc, '_>) {
         let state = self.0.read().state;
         let current_state = self.get_state_child(state.into());
 
@@ -651,44 +661,6 @@ impl<'gc> TDisplayObject<'gc> for Avm2Button<'gc> {
         }
 
         false
-    }
-
-    fn mouse_pick(
-        &self,
-        context: &mut UpdateContext<'_, 'gc, '_>,
-        point: (Twips, Twips),
-        require_button_mode: bool,
-    ) -> Option<DisplayObject<'gc>> {
-        // The button is hovered if the mouse is over any child nodes.
-        if self.visible() {
-            let state = self.0.read().state;
-            let state_child = self.get_state_child(state.into());
-
-            if let Some(state_child) = state_child {
-                let mouse_pick = state_child.mouse_pick(context, point, require_button_mode);
-                if mouse_pick.is_some() {
-                    return mouse_pick;
-                }
-            }
-
-            let hit_area = self.0.read().hit_area;
-            if let Some(hit_area) = hit_area {
-                // hit_area is not actually a child, so transform point into local space before passing it down.
-                let point = self.global_to_local(point);
-                if hit_area.hit_test_shape(context, point, HitTestOptions::MOUSE_PICK) {
-                    return Some((*self).into());
-                }
-            }
-        }
-        None
-    }
-
-    fn mouse_cursor(&self) -> MouseCursor {
-        if self.use_hand_cursor() {
-            MouseCursor::Hand
-        } else {
-            MouseCursor::Arrow
-        }
     }
 
     fn object2(&self) -> Avm2Value<'gc> {
@@ -773,7 +745,7 @@ impl<'gc> TInteractiveObject<'gc> for Avm2Button<'gc> {
     fn propagate_to_children(
         self,
         context: &mut UpdateContext<'_, 'gc, '_>,
-        event: ClipEvent,
+        event: ClipEvent<'gc>,
     ) -> ClipEventResult {
         if event.propagates() {
             let state = self.0.read().state;
@@ -792,33 +764,76 @@ impl<'gc> TInteractiveObject<'gc> for Avm2Button<'gc> {
     fn event_dispatch(
         self,
         context: &mut UpdateContext<'_, 'gc, '_>,
-        event: ClipEvent,
+        event: ClipEvent<'gc>,
     ) -> ClipEventResult {
-        let handled = ClipEventResult::NotHandled;
         let write = self.0.write(context.gc_context);
 
         // Translate the clip event to a button event, based on how the button state changes.
         let static_data = write.static_data;
         let static_data = static_data.read();
         let (new_state, sound) = match event {
-            ClipEvent::DragOut => (ButtonState::Over, None),
-            ClipEvent::DragOver => (ButtonState::Down, None),
+            ClipEvent::DragOut { .. } => (ButtonState::Over, None),
+            ClipEvent::DragOver { .. } => (ButtonState::Down, None),
             ClipEvent::Press => (ButtonState::Down, static_data.over_to_down_sound.as_ref()),
             ClipEvent::Release => (ButtonState::Over, static_data.down_to_over_sound.as_ref()),
             ClipEvent::ReleaseOutside => (ButtonState::Up, static_data.over_to_up_sound.as_ref()),
-            ClipEvent::RollOut => (ButtonState::Up, static_data.over_to_up_sound.as_ref()),
-            ClipEvent::RollOver => (ButtonState::Over, static_data.up_to_over_sound.as_ref()),
+            ClipEvent::RollOut { .. } => (ButtonState::Up, static_data.over_to_up_sound.as_ref()),
+            ClipEvent::RollOver { .. } => {
+                (ButtonState::Over, static_data.up_to_over_sound.as_ref())
+            }
             _ => return ClipEventResult::NotHandled,
         };
 
         write.play_sound(context, sound);
+        let old_state = write.state;
+        drop(write);
 
-        if write.state != new_state {
-            drop(write);
+        if old_state != new_state {
             self.set_state(context, new_state);
         }
 
-        handled
+        self.event_dispatch_to_avm2(context, event)
+    }
+
+    fn mouse_pick(
+        &self,
+        context: &mut UpdateContext<'_, 'gc, '_>,
+        point: (Twips, Twips),
+        require_button_mode: bool,
+    ) -> Option<InteractiveObject<'gc>> {
+        // The button is hovered if the mouse is over any child nodes.
+        if self.visible() && self.mouse_enabled() {
+            let state = self.0.read().state;
+            let state_child = self.get_state_child(state.into());
+
+            if let Some(state_child) = state_child {
+                let mouse_pick = state_child
+                    .as_interactive()
+                    .and_then(|c| c.mouse_pick(context, point, require_button_mode));
+                if mouse_pick.is_some() {
+                    return mouse_pick;
+                }
+            }
+
+            let hit_area = self.0.read().hit_area;
+            if let Some(hit_area) = hit_area {
+                // hit_area is not actually a child, so transform point into local space before passing it down.
+                let point = self.global_to_local(point);
+                if hit_area.hit_test_shape(context, point, HitTestOptions::MOUSE_PICK) {
+                    return Some((*self).into());
+                }
+            }
+        }
+        None
+    }
+
+    fn mouse_cursor(self, _context: &mut UpdateContext<'_, 'gc, '_>) -> MouseCursor {
+        // TODO: Should we also need to check for the `enabled` property like AVM1 buttons?
+        if self.use_hand_cursor() {
+            MouseCursor::Hand
+        } else {
+            MouseCursor::Arrow
+        }
     }
 }
 

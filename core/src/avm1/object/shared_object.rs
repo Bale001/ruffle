@@ -37,7 +37,7 @@ impl<'gc> SharedObject<'gc> {
         SharedObject(GcCell::allocate(
             gc_context,
             SharedObjectData {
-                base: ScriptObject::object(gc_context, proto),
+                base: ScriptObject::new(gc_context, proto),
                 name: None,
             },
         ))
@@ -48,12 +48,7 @@ impl<'gc> SharedObject<'gc> {
     }
 
     pub fn get_name(&self) -> String {
-        self.0
-            .read()
-            .name
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| "".to_string())
+        self.0.read().name.as_ref().cloned().unwrap_or_default()
     }
 }
 

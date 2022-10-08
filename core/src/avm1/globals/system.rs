@@ -3,7 +3,8 @@ use crate::avm1::error::Error;
 use crate::avm1::object::Object;
 use crate::avm1::property::Attribute;
 use crate::avm1::property_decl::{define_properties_on, Declaration};
-use crate::avm1::{Avm1, ScriptObject, TObject, Value};
+use crate::avm1::runtime::Avm1;
+use crate::avm1::{ScriptObject, TObject, Value};
 use crate::avm_warn;
 use bitflags::bitflags;
 use core::fmt;
@@ -19,6 +20,7 @@ const OBJECT_DECLS: &[Declaration] = declare_properties! {
 };
 
 /// Available cpu architectures
+#[allow(dead_code)]
 pub enum CpuArchitecture {
     PowerPc,
     X86,
@@ -38,6 +40,7 @@ impl fmt::Display for CpuArchitecture {
 }
 
 /// Available type of sandbox for a given SWF
+#[allow(dead_code)]
 pub enum SandboxType {
     Remote,
     LocalWithFile,
@@ -57,6 +60,7 @@ impl fmt::Display for SandboxType {
 }
 
 /// The available host operating systems
+#[allow(dead_code)]
 pub enum OperatingSystem {
     WindowsXp,
     Windows2k,
@@ -86,6 +90,7 @@ impl fmt::Display for OperatingSystem {
 }
 
 /// The available player manufacturers
+#[allow(dead_code)]
 pub enum Manufacturer {
     Windows,
     Macintosh,
@@ -120,6 +125,7 @@ impl Manufacturer {
 }
 
 /// The language of the host os
+#[allow(dead_code)]
 pub enum Language {
     Czech,
     Danish,
@@ -179,6 +185,7 @@ impl Language {
 }
 
 /// The supported colors of the screen
+#[allow(dead_code)]
 pub enum ScreenColor {
     Color,
     Gray,
@@ -195,6 +202,7 @@ impl fmt::Display for ScreenColor {
     }
 }
 /// The type of the player
+#[allow(dead_code)]
 pub enum PlayerType {
     StandAlone,
     External,
@@ -291,7 +299,7 @@ impl SystemProperties {
         format!(
             "{} {},0,0,0",
             self.manufacturer.get_platform_name(),
-            avm.player_version
+            avm.player_version()
         )
     }
 
@@ -361,7 +369,7 @@ impl SystemProperties {
                 "M",
                 &self.encode_string(
                     self.manufacturer
-                        .get_manufacturer_string(avm.player_version)
+                        .get_manufacturer_string(avm.player_version())
                         .as_str(),
                 ),
             )
@@ -372,7 +380,7 @@ impl SystemProperties {
             .append_pair("COL", &self.screen_color.to_string())
             .append_pair("AR", &self.aspect_ratio.to_string())
             .append_pair("OS", &self.encode_string(&self.os.to_string()))
-            .append_pair("L", self.language.get_language_code(avm.player_version))
+            .append_pair("L", self.language.get_language_code(avm.player_version()))
             .append_pair("IME", self.encode_capability(SystemCapabilities::IME))
             .append_pair("PT", &self.player_type.to_string())
             .append_pair(
@@ -516,7 +524,7 @@ pub fn create<'gc>(
     capabilities: Object<'gc>,
     ime: Object<'gc>,
 ) -> Object<'gc> {
-    let system = ScriptObject::object(gc_context, proto);
+    let system = ScriptObject::new(gc_context, proto);
     define_properties_on(OBJECT_DECLS, gc_context, system, fn_proto);
     system.define_value(gc_context, "IME", ime.into(), Attribute::empty());
     system.define_value(gc_context, "security", security.into(), Attribute::empty());

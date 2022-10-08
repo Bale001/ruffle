@@ -6,12 +6,12 @@ use crate::avm1::object::super_object::SuperObject;
 use crate::avm1::property::Attribute;
 use crate::avm1::scope::Scope;
 use crate::avm1::value::Value;
-use crate::avm1::{ArrayObject, AvmString, Object, ObjectPtr, ScriptObject, TObject};
+use crate::avm1::{ArrayObject, Object, ObjectPtr, ScriptObject, TObject};
 use crate::display_object::{DisplayObject, TDisplayObject};
+use crate::string::AvmString;
 use crate::tag_utils::SwfSlice;
 use gc_arena::{Collect, CollectionContext, Gc, GcCell, MutationContext};
-use std::borrow::Cow;
-use std::fmt;
+use std::{borrow::Cow, fmt, num::NonZeroU8};
 use swf::{avm1::types::FunctionFlags, SwfStr};
 
 /// Represents a function defined in Ruffle's code.
@@ -35,12 +35,13 @@ pub type NativeFunction = for<'gc> fn(
 ) -> Result<Value<'gc>, Error<'gc>>;
 
 /// Indicates the reason for an execution
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ExecutionReason {
-    /// This execution is a "normal" function call, from either user-code or builtins.
+    /// This execution is a "normal" function call from ActionScript bytecode.
     FunctionCall,
 
-    /// This execution is a "special" function call, such as a getter or setter.
+    /// This execution is a "special" internal function call from the player,
+    /// such as getters, setters, `toString`, or event handlers.
     Special,
 }
 
@@ -62,10 +63,8 @@ pub struct Avm1Function<'gc> {
     /// set. Any register beyond this ID will be served from the global one.
     register_count: u8,
 
-    /// The names of the function parameters and their register mappings.
-    /// r0 indicates that no register shall be written and the parameter stored
-    /// as a Variable instead.
-    params: Vec<(Option<u8>, AvmString<'gc>)>,
+    /// The parameters of the function.
+    params: Vec<Param<'gc>>,
 
     /// The scope the function was born into.
     scope: GcCell<'gc, Scope<'gc>>,
@@ -83,62 +82,21 @@ pub struct Avm1Function<'gc> {
 }
 
 impl<'gc> Avm1Function<'gc> {
-    /// Construct a function from a DefineFunction action.
-    ///
-    /// Parameters not specified in DefineFunction are filled with reasonable
-    /// defaults.
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_df1(
-        gc_context: MutationContext<'gc, '_>,
-        swf_version: u8,
-        actions: SwfSlice,
-        name: &str,
-        params: &[&'_ SwfStr],
-        scope: GcCell<'gc, Scope<'gc>>,
-        constant_pool: GcCell<'gc, Vec<Value<'gc>>>,
-        base_clip: DisplayObject<'gc>,
-    ) -> Self {
-        let name = if name.is_empty() {
-            None
-        } else {
-            Some(AvmString::new_utf8(gc_context, name))
-        };
-
-        Avm1Function {
-            swf_version,
-            data: actions,
-            name,
-            register_count: 0,
-            params: params
-                .iter()
-                .map(|&s| {
-                    let name = s.to_str_lossy(SwfStr::encoding_for_version(swf_version));
-                    (None, AvmString::new_utf8(gc_context, name))
-                })
-                .collect(),
-            scope,
-            constant_pool,
-            base_clip,
-            flags: FunctionFlags::empty(),
-        }
-    }
-
     /// Construct a function from a DefineFunction2 action.
-    pub fn from_df2(
+    pub fn from_swf_function(
         gc_context: MutationContext<'gc, '_>,
         swf_version: u8,
         actions: SwfSlice,
-        swf_function: &swf::avm1::types::Function,
+        swf_function: swf::avm1::types::DefineFunction2,
         scope: GcCell<'gc, Scope<'gc>>,
         constant_pool: GcCell<'gc, Vec<Value<'gc>>>,
         base_clip: DisplayObject<'gc>,
     ) -> Self {
+        let encoding = SwfStr::encoding_for_version(swf_version);
         let name = if swf_function.name.is_empty() {
             None
         } else {
-            let name = swf_function
-                .name
-                .to_str_lossy(SwfStr::encoding_for_version(swf_version));
+            let name = swf_function.name.to_str_lossy(encoding);
             Some(AvmString::new_utf8(gc_context, name))
         };
 
@@ -146,10 +104,11 @@ impl<'gc> Avm1Function<'gc> {
             .params
             .iter()
             .map(|p| {
-                let name = p
-                    .name
-                    .to_str_lossy(SwfStr::encoding_for_version(swf_version));
-                (p.register_index, AvmString::new_utf8(gc_context, name))
+                let name = p.name.to_str_lossy(encoding);
+                Param {
+                    register: p.register_index,
+                    name: AvmString::new_utf8(gc_context, name),
+                }
             })
             .collect();
 
@@ -185,6 +144,148 @@ impl<'gc> Avm1Function<'gc> {
     pub fn register_count(&self) -> u8 {
         self.register_count
     }
+
+    fn debug_string_for_call(&self, name: ExecutionName<'gc>, args: &[Value<'gc>]) -> String {
+        let mut result = match self.name.map(ExecutionName::Dynamic).unwrap_or(name) {
+            ExecutionName::Static(n) => n.to_owned(),
+            ExecutionName::Dynamic(n) => n.to_utf8_lossy().into_owned(),
+        };
+        result.push('(');
+        for i in 0..args.len() {
+            result.push_str(args.get(i).unwrap().type_of());
+            if i < args.len() - 1 {
+                result.push_str(", ");
+            }
+        }
+        result.push(')');
+        result
+    }
+
+    fn load_this(&self, frame: &mut Activation<'_, 'gc, '_>, this: Value<'gc>, preload_r: &mut u8) {
+        let preload = self.flags.contains(FunctionFlags::PRELOAD_THIS);
+        let suppress = self.flags.contains(FunctionFlags::SUPPRESS_THIS);
+
+        if preload {
+            // The register is set to undefined if both flags are set.
+            let this = if suppress { Value::Undefined } else { this };
+            frame.set_local_register(*preload_r, this);
+            *preload_r += 1;
+        }
+    }
+
+    fn load_arguments(
+        &self,
+        frame: &mut Activation<'_, 'gc, '_>,
+        args: &[Value<'gc>],
+        caller: Option<Object<'gc>>,
+        preload_r: &mut u8,
+    ) {
+        let preload = self.flags.contains(FunctionFlags::PRELOAD_ARGUMENTS);
+        let suppress = self.flags.contains(FunctionFlags::SUPPRESS_ARGUMENTS);
+
+        if suppress && !preload {
+            return;
+        }
+
+        let arguments = ArrayObject::new(
+            frame.context.gc_context,
+            frame.context.avm1.prototypes().array,
+            args.iter().cloned(),
+        );
+
+        arguments.define_value(
+            frame.context.gc_context,
+            "callee",
+            frame.callee.unwrap().into(),
+            Attribute::DONT_ENUM,
+        );
+
+        arguments.define_value(
+            frame.context.gc_context,
+            "caller",
+            caller.map(Value::from).unwrap_or(Value::Null),
+            Attribute::DONT_ENUM,
+        );
+
+        let arguments = Value::from(arguments);
+
+        // Contrarily to `this` and `super`, setting both flags is equivalent to just setting `preload`.
+        if preload {
+            frame.set_local_register(*preload_r, arguments);
+            *preload_r += 1;
+        } else {
+            frame.force_define_local("arguments".into(), arguments);
+        }
+    }
+
+    fn load_super(
+        &self,
+        frame: &mut Activation<'_, 'gc, '_>,
+        this: Option<Object<'gc>>,
+        depth: u8,
+        preload_r: &mut u8,
+    ) {
+        let preload = self.flags.contains(FunctionFlags::PRELOAD_SUPER);
+        let suppress = self.flags.contains(FunctionFlags::SUPPRESS_SUPER);
+
+        // TODO: `super` should only be defined if this was a method call (depth > 0?)
+        // `f[""]()` emits a CallMethod op, causing `this` to be undefined, but `super` is a function; what is it?
+        let zuper = this
+            .filter(|_| !suppress)
+            .map(|this| SuperObject::new(frame, this, depth).into());
+
+        if preload {
+            // The register is set to undefined if both flags are set.
+            frame.set_local_register(*preload_r, zuper.unwrap_or(Value::Undefined));
+            *preload_r += 1;
+        } else if let Some(zuper) = zuper {
+            frame.force_define_local("super".into(), zuper);
+        }
+    }
+
+    fn load_root(&self, frame: &mut Activation<'_, 'gc, '_>, preload_r: &mut u8) {
+        if self.flags.contains(FunctionFlags::PRELOAD_ROOT) {
+            let root = frame.base_clip().avm1_root().object();
+            frame.set_local_register(*preload_r, root);
+            *preload_r += 1;
+        }
+    }
+
+    fn load_parent(&self, frame: &mut Activation<'_, 'gc, '_>, preload_r: &mut u8) {
+        if self.flags.contains(FunctionFlags::PRELOAD_PARENT) {
+            // If _parent is undefined (because this is a root timeline), it actually does not get pushed,
+            // and _global ends up incorrectly taking _parent's register.
+            // See test for more info.
+            if let Some(parent) = frame.base_clip().avm1_parent() {
+                frame.set_local_register(*preload_r, parent.object());
+                *preload_r += 1;
+            }
+        }
+    }
+
+    fn load_global(&self, frame: &mut Activation<'_, 'gc, '_>, preload_r: &mut u8) {
+        if self.flags.contains(FunctionFlags::PRELOAD_GLOBAL) {
+            let global = frame.context.avm1.global_object();
+            frame.set_local_register(*preload_r, global);
+            *preload_r += 1;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Collect)]
+#[collect(no_drop)]
+struct Param<'gc> {
+    /// The register the argument will be preloaded into.
+    ///
+    /// If `register` is `None`, then this parameter will be stored in a named variable in the
+    /// function activation and can be accessed using `GetVariable`/`SetVariable`.
+    /// Otherwise, the parameter is loaded into a register and must be accessed with
+    /// `Push`/`StoreRegister`.
+    #[collect(require_static)]
+    register: Option<NonZeroU8>,
+
+    /// The name of the parameter.
+    name: AvmString<'gc>,
 }
 
 /// Represents a function that can be defined in the Ruffle runtime or by the
@@ -238,171 +339,130 @@ impl<'gc> Executable<'gc> {
         &self,
         name: ExecutionName<'gc>,
         activation: &mut Activation<'_, 'gc, '_>,
-        this: Object<'gc>,
+        this: Value<'gc>,
         depth: u8,
         args: &[Value<'gc>],
         reason: ExecutionReason,
         callee: Object<'gc>,
     ) -> Result<Value<'gc>, Error<'gc>> {
-        match self {
-            Executable::Native(nf) => nf(activation, this, args),
-            Executable::Action(af) => {
-                let child_scope = GcCell::allocate(
-                    activation.context.gc_context,
-                    Scope::new_local_scope(af.scope(), activation.context.gc_context),
-                );
+        let af = match self {
+            Executable::Native(nf) => {
+                // TODO: Change NativeFunction to accept `this: Value`.
+                let this = this.coerce_to_object(activation);
+                return nf(activation, this, args);
+            }
+            Executable::Action(af) => af,
+        };
 
-                let arguments = if af.flags.contains(FunctionFlags::SUPPRESS_ARGUMENTS) {
-                    ArrayObject::empty(activation)
-                } else {
-                    ArrayObject::new(
+        let this_obj = match this {
+            Value::Object(obj) => Some(obj),
+            _ => None,
+        };
+
+        let target = activation.target_clip_or_root();
+        let is_closure = activation.swf_version() >= 6;
+        let base_clip =
+            if (is_closure || reason == ExecutionReason::Special) && !af.base_clip.removed() {
+                af.base_clip
+            } else {
+                this_obj
+                    .and_then(|this| this.as_display_object())
+                    .unwrap_or(target)
+            };
+        let (swf_version, parent_scope) = if is_closure {
+            // Function calls in a v6+ SWF are proper closures, and "close" over the scope that defined the function:
+            // * Use the SWF version from the SWF that defined the function.
+            // * Use the base clip from when the function was defined.
+            // * Close over the scope from when the function was defined.
+            (af.swf_version(), af.scope())
+        } else {
+            // Function calls in a v5 SWF are *not* closures, and will use the settings of
+            // `this`, regardless of the function's origin:
+            // * Use the SWF version of `this`.
+            // * Use the base clip of `this`.
+            // * Allocate a new scope using the given base clip. No previous scope is closed over.
+            let swf_version = base_clip.swf_version().max(5);
+            let base_clip_obj = match base_clip.object() {
+                Value::Object(o) => o,
+                _ => unreachable!(),
+            };
+            // TODO: It would be nice to avoid these extra Scope allocs.
+            let scope = GcCell::allocate(
+                activation.context.gc_context,
+                Scope::new(
+                    GcCell::allocate(
                         activation.context.gc_context,
-                        activation.context.avm1.prototypes().array,
-                        args.iter().cloned(),
-                    )
-                };
-                arguments.define_value(
-                    activation.context.gc_context,
-                    "callee",
-                    callee.into(),
-                    Attribute::DONT_ENUM,
-                );
-                // The caller is the previous callee.
-                arguments.define_value(
-                    activation.context.gc_context,
-                    "caller",
-                    activation.callee.map(Value::from).unwrap_or(Value::Null),
-                    Attribute::DONT_ENUM,
-                );
+                        Scope::from_global_object(activation.context.avm1.global_object_cell()),
+                    ),
+                    super::scope::ScopeClass::Target,
+                    base_clip_obj,
+                ),
+            );
+            (swf_version, scope)
+        };
 
-                let super_object: Option<Object<'gc>> =
-                    if !af.flags.contains(FunctionFlags::SUPPRESS_SUPER) {
-                        Some(SuperObject::new(activation, this, depth).into())
-                    } else {
-                        None
-                    };
+        let child_scope = GcCell::allocate(
+            activation.context.gc_context,
+            Scope::new_local_scope(parent_scope, activation.context.gc_context),
+        );
 
-                let effective_version = if activation.swf_version() > 5 {
-                    if !af.base_clip.removed() {
-                        af.base_clip.swf_version()
-                    } else {
-                        af.swf_version()
-                    }
-                } else {
-                    this.as_display_object()
-                        .map(|dn| dn.swf_version())
-                        .unwrap_or(activation.context.player_version)
-                };
+        // The caller is the previous callee.
+        let arguments_caller = activation.callee;
 
-                let name = if cfg!(feature = "avm_debug") {
-                    let mut result = match af.name.map(ExecutionName::Dynamic).unwrap_or(name) {
-                        ExecutionName::Static(n) => n.to_owned(),
-                        ExecutionName::Dynamic(n) => n.to_utf8_lossy().into_owned(),
-                    };
+        let name = if cfg!(feature = "avm_debug") {
+            Cow::Owned(af.debug_string_for_call(name, args))
+        } else {
+            Cow::Borrowed("[Anonymous]")
+        };
 
-                    result.push('(');
-                    for i in 0..args.len() {
-                        result.push_str(args.get(i).unwrap().type_of());
-                        if i < args.len() - 1 {
-                            result.push_str(", ");
-                        }
-                    }
-                    result.push(')');
+        let is_this_inherited = af
+            .flags
+            .intersects(FunctionFlags::PRELOAD_THIS | FunctionFlags::SUPPRESS_THIS);
+        let local_this = if is_this_inherited {
+            activation.this_cell()
+        } else {
+            this
+        };
 
-                    Cow::Owned(result)
-                } else {
-                    Cow::Borrowed("[Anonymous]")
-                };
+        let max_recursion_depth = activation.context.avm1.max_recursion_depth();
+        let mut frame = Activation::from_action(
+            activation.context.reborrow(),
+            activation.id.function(name, reason, max_recursion_depth)?,
+            swf_version,
+            child_scope,
+            af.constant_pool,
+            base_clip,
+            local_this,
+            Some(callee),
+        );
 
-                let max_recursion_depth = activation.context.avm1.max_recursion_depth();
-                let base_clip = if effective_version > 5 && !af.base_clip.removed() {
-                    af.base_clip
-                } else {
-                    this.as_display_object()
-                        .unwrap_or_else(|| activation.base_clip())
-                };
-                let mut frame = Activation::from_action(
-                    activation.context.reborrow(),
-                    activation.id.function(name, reason, max_recursion_depth)?,
-                    effective_version,
-                    child_scope,
-                    af.constant_pool,
-                    base_clip,
-                    this,
-                    Some(callee),
-                    Some(arguments.into()),
-                );
+        frame.allocate_local_registers(af.register_count(), frame.context.gc_context);
 
-                frame.allocate_local_registers(af.register_count(), frame.context.gc_context);
+        let mut preload_r = 1;
+        af.load_this(&mut frame, this, &mut preload_r);
+        af.load_arguments(&mut frame, args, arguments_caller, &mut preload_r);
+        af.load_super(&mut frame, this_obj, depth, &mut preload_r);
+        af.load_root(&mut frame, &mut preload_r);
+        af.load_parent(&mut frame, &mut preload_r);
+        af.load_global(&mut frame, &mut preload_r);
 
-                let mut preload_r = 1;
+        // Any unassigned args are set to undefined to prevent assignments from leaking to the parent scope (#2166)
+        let args_iter = args
+            .iter()
+            .cloned()
+            .chain(std::iter::repeat(Value::Undefined));
 
-                if af.flags.contains(FunctionFlags::PRELOAD_THIS) {
-                    //TODO: What happens if you specify both suppress and
-                    //preload for this?
-                    frame.set_local_register(preload_r, this.into());
-                    preload_r += 1;
-                }
-
-                if af.flags.contains(FunctionFlags::PRELOAD_ARGUMENTS) {
-                    //TODO: What happens if you specify both suppress and
-                    //preload for arguments?
-                    frame.set_local_register(preload_r, arguments.into());
-                    preload_r += 1;
-                }
-
-                if let Some(super_object) = super_object {
-                    if af.flags.contains(FunctionFlags::PRELOAD_SUPER) {
-                        frame.set_local_register(preload_r, super_object.into());
-                        //TODO: What happens if you specify both suppress and
-                        //preload for super?
-                        preload_r += 1;
-                    } else {
-                        frame.force_define_local("super".into(), super_object.into());
-                    }
-                }
-
-                if af.flags.contains(FunctionFlags::PRELOAD_ROOT) {
-                    frame.set_local_register(
-                        preload_r,
-                        af.base_clip.avm1_root(&frame.context)?.object(),
-                    );
-                    preload_r += 1;
-                }
-
-                if af.flags.contains(FunctionFlags::PRELOAD_PARENT) {
-                    // If _parent is undefined (because this is a root timeline), it actually does not get pushed,
-                    // and _global ends up incorrectly taking _parent's register.
-                    // See test for more info.
-                    if let Some(parent) = af.base_clip.avm1_parent() {
-                        frame.set_local_register(preload_r, parent.object());
-                        preload_r += 1;
-                    }
-                }
-
-                if af.flags.contains(FunctionFlags::PRELOAD_GLOBAL) {
-                    let global = frame.context.avm1.global_object();
-                    frame.set_local_register(preload_r, global);
-                }
-
-                // Any unassigned args are set to undefined to prevent assignments from leaking to the parent scope (#2166)
-                let args_iter = args
-                    .iter()
-                    .cloned()
-                    .chain(std::iter::repeat(Value::Undefined));
-
-                //TODO: What happens if the argument registers clash with the
-                //preloaded registers? What gets done last?
-                for (param, value) in af.params.iter().zip(args_iter) {
-                    match param {
-                        (Some(argreg), _argname) => frame.set_local_register(*argreg, value),
-                        (None, argname) => frame.force_define_local(*argname, value),
-                    }
-                }
-
-                Ok(frame.run_actions(af.data.clone())?.value())
+        //TODO: What happens if the argument registers clash with the
+        //preloaded registers? What gets done last?
+        for (param, value) in af.params.iter().zip(args_iter) {
+            if let Some(register) = param.register {
+                frame.set_local_register(register.get(), value);
+            } else {
+                frame.force_define_local(param.name, value);
             }
         }
+
+        Ok(frame.run_actions(af.data.clone())?.value())
     }
 }
 
@@ -417,8 +477,6 @@ impl<'gc> From<Gc<'gc, Avm1Function<'gc>>> for Executable<'gc> {
         Executable::Action(af)
     }
 }
-
-pub const TYPE_OF_FUNCTION: &str = "function";
 
 /// Represents an `Object` that holds executable code.
 #[derive(Debug, Clone, Collect, Copy)]
@@ -439,9 +497,6 @@ struct FunctionObjectData<'gc> {
     function: Option<Executable<'gc>>,
     /// The code that will be invoked when this object is constructed.
     constructor: Option<Executable<'gc>>,
-
-    /// The value to be returned by `toString` and `valueOf`.
-    primitive: Value<'gc>,
 }
 
 impl<'gc> FunctionObject<'gc> {
@@ -452,7 +507,7 @@ impl<'gc> FunctionObject<'gc> {
         constructor: Option<Executable<'gc>>,
         fn_proto: Option<Object<'gc>>,
     ) -> Self {
-        let base = ScriptObject::object(gc_context, fn_proto);
+        let base = ScriptObject::new(gc_context, fn_proto);
 
         FunctionObject {
             base,
@@ -460,7 +515,6 @@ impl<'gc> FunctionObject<'gc> {
                 gc_context,
                 FunctionObjectData {
                     function,
-                    primitive: "[type Function]".into(),
                     constructor,
                 },
             ),
@@ -551,7 +605,7 @@ impl<'gc> TObject<'gc> for FunctionObject<'gc> {
         &self,
         name: AvmString<'gc>,
         activation: &mut Activation<'_, 'gc, '_>,
-        this: Object<'gc>,
+        this: Value<'gc>,
         args: &[Value<'gc>],
     ) -> Result<Value<'gc>, Error<'gc>> {
         match self.as_executable() {
@@ -593,7 +647,7 @@ impl<'gc> TObject<'gc> for FunctionObject<'gc> {
             let _ = exec.exec(
                 ExecutionName::Static("[ctor]"),
                 activation,
-                this,
+                this.into(),
                 1,
                 args,
                 ExecutionReason::FunctionCall,
@@ -603,7 +657,7 @@ impl<'gc> TObject<'gc> for FunctionObject<'gc> {
             let _ = exec.exec(
                 ExecutionName::Static("[ctor]"),
                 activation,
-                this,
+                this.into(),
                 1,
                 args,
                 ExecutionReason::FunctionCall,
@@ -644,7 +698,7 @@ impl<'gc> TObject<'gc> for FunctionObject<'gc> {
             let this = exec.exec(
                 ExecutionName::Static("[ctor]"),
                 activation,
-                this,
+                this.into(),
                 1,
                 args,
                 ExecutionReason::FunctionCall,
@@ -655,7 +709,7 @@ impl<'gc> TObject<'gc> for FunctionObject<'gc> {
             let _ = exec.exec(
                 ExecutionName::Static("[ctor]"),
                 activation,
-                this,
+                this.into(),
                 1,
                 args,
                 ExecutionReason::FunctionCall,
@@ -688,14 +742,13 @@ impl<'gc> TObject<'gc> for FunctionObject<'gc> {
         activation: &mut Activation<'_, 'gc, '_>,
         prototype: Object<'gc>,
     ) -> Result<Object<'gc>, Error<'gc>> {
-        let base = ScriptObject::object(activation.context.gc_context, Some(prototype));
+        let base = ScriptObject::new(activation.context.gc_context, Some(prototype));
         let fn_object = FunctionObject {
             base,
             data: GcCell::allocate(
                 activation.context.gc_context,
                 FunctionObjectData {
                     function: None,
-                    primitive: "[type Function]".into(),
                     constructor: None,
                 },
             ),
@@ -813,10 +866,6 @@ impl<'gc> TObject<'gc> for FunctionObject<'gc> {
         self.base.get_keys(activation)
     }
 
-    fn type_of(&self) -> &'static str {
-        TYPE_OF_FUNCTION
-    }
-
     fn interfaces(&self) -> Vec<Object<'gc>> {
         self.base.interfaces()
     }
@@ -880,13 +929,13 @@ impl<'gc> TObject<'gc> for FunctionObject<'gc> {
 macro_rules! constructor_to_fn {
     ($f:expr) => {{
         fn _constructor_fn<'gc>(
-            activation: &mut crate::avm1::activation::Activation<'_, 'gc, '_>,
-            this: crate::avm1::Object<'gc>,
-            args: &[crate::avm1::Value<'gc>],
-        ) -> Result<crate::avm1::Value<'gc>, crate::avm1::error::Error<'gc>> {
+            activation: &mut $crate::avm1::activation::Activation<'_, 'gc, '_>,
+            this: $crate::avm1::Object<'gc>,
+            args: &[$crate::avm1::Value<'gc>],
+        ) -> Result<$crate::avm1::Value<'gc>, $crate::avm1::error::Error<'gc>> {
             let _ = $f(activation, this, args)?;
-            Ok(crate::avm1::Value::Undefined)
+            Ok($crate::avm1::Value::Undefined)
         }
-        crate::avm1::function::Executable::Native(_constructor_fn)
+        $crate::avm1::function::Executable::Native(_constructor_fn)
     }};
 }

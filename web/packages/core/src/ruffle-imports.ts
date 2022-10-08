@@ -28,13 +28,34 @@ export function copyToAudioBuffer(
 }
 
 /**
- * Returns `AudioContext.getOutputTimestamp`, defaulting to `context.currentTime` if
- * `getOutputTimestamp` is unavailable. This is necessary because `web-sys` does not yet export
- * `AudioBuffer.copyToChannel`.
+ * Returns the estimated output timestamp for the audio context.
+ * This is necessary because web-sys does not export `AudioContext.baseLatency`.
  *
  * @internal
  */
 export function getAudioOutputTimestamp(context: AudioContext): number {
-    const timestamp = context.getOutputTimestamp?.();
-    return timestamp?.contextTime ?? context.currentTime - context.baseLatency;
+    // TODO: Ideally we'd use `context.getOutputTimestamp`, but this is broken as of Safari 15.4.
+    return context.currentTime - context.baseLatency;
+}
+
+/**
+ * Copies interleaved stereo audio data into an `AudioBuffer`.
+ *
+ * @internal
+ */
+export function copyToAudioBufferInterleaved(
+    audioBuffer: AudioBuffer,
+    interleavedData: ArrayLike<number>
+): void {
+    const numSamples = audioBuffer.length;
+    const leftBuffer = audioBuffer.getChannelData(0);
+    const rightBuffer = audioBuffer.getChannelData(1);
+    let i = 0;
+    let sample = 0;
+    while (sample < numSamples) {
+        leftBuffer[sample] = interleavedData[i];
+        rightBuffer[sample] = interleavedData[i + 1];
+        sample++;
+        i += 2;
+    }
 }

@@ -10,10 +10,9 @@ use std::cell::{Ref, RefMut};
 /// A class instance allocator that allocates Date objects.
 pub fn date_allocator<'gc>(
     class: ClassObject<'gc>,
-    proto: Object<'gc>,
     activation: &mut Activation<'_, 'gc, '_>,
-) -> Result<Object<'gc>, Error> {
-    let base = ScriptObjectData::base_new(Some(proto), Some(class));
+) -> Result<Object<'gc>, Error<'gc>> {
+    let base = ScriptObjectData::new(class);
 
     Ok(DateObject(GcCell::allocate(
         activation.context.gc_context,
@@ -65,21 +64,7 @@ impl<'gc> TObject<'gc> for DateObject<'gc> {
         self.0.as_ptr() as *const ObjectPtr
     }
 
-    fn derive(&self, activation: &mut Activation<'_, 'gc, '_>) -> Result<Object<'gc>, Error> {
-        let this: Object<'gc> = Object::DateObject(*self);
-        let base = ScriptObjectData::base_new(Some(this), None);
-
-        Ok(DateObject(GcCell::allocate(
-            activation.context.gc_context,
-            DateObjectData {
-                base,
-                date_time: None,
-            },
-        ))
-        .into())
-    }
-
-    fn value_of(&self, _mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error> {
+    fn value_of(&self, _mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error<'gc>> {
         if let Some(date) = self.date_time() {
             Ok((date.timestamp_millis() as f64).into())
         } else {

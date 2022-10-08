@@ -11,10 +11,9 @@ use std::cell::{Ref, RefMut};
 /// A class instance allocator that allocates XML objects.
 pub fn xml_allocator<'gc>(
     class: ClassObject<'gc>,
-    proto: Object<'gc>,
     activation: &mut Activation<'_, 'gc, '_>,
-) -> Result<Object<'gc>, Error> {
-    let base = ScriptObjectData::base_new(Some(proto), Some(class));
+) -> Result<Object<'gc>, Error<'gc>> {
+    let base = ScriptObjectData::new(class);
 
     Ok(XmlObject(GcCell::allocate(
         activation.context.gc_context,
@@ -47,18 +46,11 @@ impl<'gc> TObject<'gc> for XmlObject<'gc> {
         self.0.as_ptr() as *const ObjectPtr
     }
 
-    fn derive(&self, activation: &mut Activation<'_, 'gc, '_>) -> Result<Object<'gc>, Error> {
-        let this: Object<'gc> = Object::XmlObject(*self);
-        let base = ScriptObjectData::base_new(Some(this), None);
-
-        Ok(XmlObject(GcCell::allocate(
-            activation.context.gc_context,
-            XmlObjectData { base },
-        ))
-        .into())
+    fn value_of(&self, _mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error<'gc>> {
+        Ok(Value::Object(Object::from(*self)))
     }
 
-    fn value_of(&self, _mc: MutationContext<'gc, '_>) -> Result<Value<'gc>, Error> {
-        Ok(Value::Object(Object::from(*self)))
+    fn as_xml(&self) -> Option<Self> {
+        Some(*self)
     }
 }

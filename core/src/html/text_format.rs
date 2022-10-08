@@ -2,14 +2,14 @@
 
 use crate::context::UpdateContext;
 use crate::html::iterators::TextSpanIter;
-use crate::string::{AvmString, Integer, Units, WStr, WString};
+use crate::string::{Integer, Units, WStr, WString};
 use crate::tag_utils::SwfMovie;
-use crate::xml::{XmlDocument, XmlName, XmlNode};
-use gc_arena::{Collect, MutationContext};
-use quick_xml::events::Event;
-use quick_xml::Reader;
+use gc_arena::Collect;
+use quick_xml::{escape::escape, events::Event, Reader};
 use std::borrow::Cow;
 use std::cmp::{min, Ordering};
+use std::collections::VecDeque;
+use std::fmt::Write;
 use std::sync::Arc;
 
 /// Replace HTML entities with their equivalent characters.
@@ -142,26 +142,26 @@ impl TextFormat {
     ) -> Self {
         let encoding = swf_movie.encoding();
         let movie_library = context.library.library_for_movie_mut(swf_movie);
-        let font = et.font_id.and_then(|fid| movie_library.get_font(fid));
+        let font = et.font_id().and_then(|fid| movie_library.get_font(fid));
         let font_class = et
-            .font_class_name
+            .font_class()
             .map(|s| WString::from_utf8(&s.to_string_lossy(encoding)))
             .or_else(|| font.map(|font| WString::from_utf8(font.descriptor().class())))
             .unwrap_or_else(|| WString::from_utf8("Times New Roman"));
-        let align = et.layout.as_ref().map(|l| l.align);
-        let left_margin = et.layout.as_ref().map(|l| l.left_margin.to_pixels());
-        let right_margin = et.layout.as_ref().map(|l| l.right_margin.to_pixels());
-        let indent = et.layout.as_ref().map(|l| l.indent.to_pixels());
-        let leading = et.layout.map(|l| l.leading.to_pixels());
+        let align = et.layout().map(|l| l.align);
+        let left_margin = et.layout().map(|l| l.left_margin.to_pixels());
+        let right_margin = et.layout().map(|l| l.right_margin.to_pixels());
+        let indent = et.layout().map(|l| l.indent.to_pixels());
+        let leading = et.layout().map(|l| l.leading.to_pixels());
 
         // TODO: Text fields that don't specify a font are assumed to be 12px
         // Times New Roman non-bold, non-italic. This will need to be revised
         // when we start supporting device fonts.
         Self {
             font: Some(font_class),
-            size: et.height.map(|h| h.to_pixels()),
+            size: et.height().map(|h| h.to_pixels()),
             color: et
-                .color
+                .color()
                 .map(|color| swf::Color::from_rgb(color.to_rgb(), 0)),
             align,
             bold: Some(font.map(|font| font.descriptor().bold()).unwrap_or(false)),
@@ -508,7 +508,7 @@ impl TextSpan {
             leading: Some(self.leading),
             letter_spacing: Some(self.letter_spacing),
             tab_stops: Some(self.tab_stops.clone()),
-            bullet: Some(self.bold),
+            bullet: Some(self.bullet),
             url: Some(self.url.clone()),
             target: Some(self.target.clone()),
         }
@@ -575,20 +575,45 @@ impl FormatSpans {
 
         // quick_xml::Reader requires a [u8] slice, but doesn't actually care about Unicode;
         // this means we can pass the raw buffer in the Latin1 case.
-        let raw_bytes = match html.units() {
-            Units::Bytes(units) => Cow::Borrowed(units),
+        let (raw_bytes, is_raw_latin1) = match html.units() {
+            Units::Bytes(units) => (Cow::Borrowed(units), true),
             // TODO: In principle, we should be able to encode (and later decode)
             // the utf16 units in the [u8] array without discarding losing surrogates.
-            Units::Wide(_) => Cow::Owned(html.to_utf8_lossy().into_owned().into_bytes()),
+            Units::Wide(_) => (
+                Cow::Owned(html.to_utf8_lossy().into_owned().into_bytes()),
+                false,
+            ),
         };
+
+        // Helper function to decode a byte sequence returned by quick_xml into a WString.
+        // TODO: use Cow<'_, WStr>?
+        let decode_to_wstr = |raw: &[u8]| -> WString {
+            if is_raw_latin1 {
+                WString::from_buf(raw.to_vec())
+            } else {
+                let utf8 = std::str::from_utf8(raw).expect("raw should be valid utf8");
+                WString::from_utf8(utf8)
+            }
+        };
+
+        // Flash ignores mismatched end tags (i.e. end tags with a missing/different corresponding
+        // start tag). `quick-xml` checks end tag mismatches by default, but it cannot recover after
+        // encountering one. Thus, we disable `quick-xml`'s check and do it ourselves in a similar
+        // manner, but in a recoverable way.
+        let mut opened_buffer: Vec<u8> = Vec::new();
+        let mut opened_starts = Vec::new();
 
         let mut reader = Reader::from_reader(&raw_bytes[..]);
         reader.expand_empty_elements(true);
         reader.check_end_names(false);
         let mut buf = Vec::new();
         loop {
+            buf.clear();
             match reader.read_event(&mut buf) {
                 Ok(Event::Start(ref e)) => {
+                    opened_starts.push(opened_buffer.len());
+                    opened_buffer.extend(e.name());
+
                     let attributes: Result<Vec<_>, _> = e.attributes().with_checks(false).collect();
                     let attributes = match attributes {
                         Ok(attributes) => attributes,
@@ -602,7 +627,7 @@ impl FormatSpans {
                             attribute
                                 .key
                                 .eq_ignore_ascii_case(name)
-                                .then(|| WString::from_buf(attribute.value.to_vec()))
+                                .then(|| decode_to_wstr(&attribute.value))
                         })
                     };
                     let mut format = format_stack.last().unwrap().clone();
@@ -737,13 +762,26 @@ impl FormatSpans {
                     format_stack.push(format);
                 }
                 Ok(Event::Text(e)) if !e.is_empty() => {
-                    let e = WString::from_buf(e.escaped().to_owned());
+                    let e = decode_to_wstr(e.escaped());
                     let e = process_html_entity(&e).unwrap_or(e);
                     let format = format_stack.last().unwrap().clone();
                     text.push_str(&e);
                     spans.push(TextSpan::with_length_and_format(e.len(), format));
                 }
                 Ok(Event::End(e)) => {
+                    // Check for a mismatch.
+                    match opened_starts.last() {
+                        Some(start) => {
+                            if e.name() != &opened_buffer[*start..] {
+                                continue;
+                            } else {
+                                opened_buffer.truncate(*start);
+                                opened_starts.pop();
+                            }
+                        }
+                        None => continue,
+                    }
+
                     match &e.name().to_ascii_lowercase()[..] {
                         b"br" | b"sbr" => {
                             // Skip pop from `format_stack`.
@@ -766,8 +804,6 @@ impl FormatSpans {
                 }
                 _ => {}
             }
-
-            buf.clear();
         }
 
         Self {
@@ -1107,346 +1143,278 @@ impl FormatSpans {
     ///    character covered by the span, plus one)
     /// 3. The string contents of the text span
     /// 4. The formatting applied to the text span.
-    pub fn iter_spans(&self) -> impl Iterator<Item = (usize, usize, &WStr, &TextSpan)> {
+    pub fn iter_spans(&self) -> TextSpanIter {
         TextSpanIter::for_format_spans(self)
     }
 
-    #[allow(clippy::float_cmp)]
-    pub fn raise_to_html<'gc>(&self, mc: MutationContext<'gc, '_>) -> XmlDocument<'gc> {
-        let document = XmlDocument::new(mc);
-        let mut root = document.as_node();
+    pub fn to_html(&self) -> WString {
+        let mut spans = self.iter_spans();
+        let mut state = if let Some((_start, _end, text, span)) = spans.next() {
+            let mut state = FormatState {
+                result: WString::new(),
+                font_stack: VecDeque::new(),
+                span,
+                is_open: false,
+            };
+            state.push_text(text);
+            state
+        } else {
+            return WString::new();
+        };
 
-        let mut last_span = self.span(0);
+        for (_start, _end, text, span) in spans {
+            state.set_span(span);
+            state.push_text(text);
+        }
 
-        //HTML elements are nested roughly in this order.
-        //Some of them nest within themselves, but we only store the last one,
-        //as Flash doesn't seem to un-nest them at all.
-        let mut last_text_format_element = None;
-        let mut last_bullet = None;
-        let mut last_paragraph = None;
-        let mut last_font = None;
-        let mut last_a = None;
-        let mut last_b = None;
-        let mut last_i = None;
-        let mut last_u = None;
+        state.close_tags();
+        state.result
+    }
+}
 
-        for (start, _end, text, span) in self.iter_spans() {
-            let ls = &last_span.unwrap();
+/// Holds required state for HTML formatting.
+struct FormatState<'a> {
+    result: WString,
+    font_stack: VecDeque<&'a TextSpan>,
+    span: &'a TextSpan,
+    is_open: bool,
+}
 
-            if ls.left_margin != span.left_margin
-                || ls.right_margin != span.right_margin
-                || ls.indent != span.indent
-                || ls.block_indent != span.block_indent
-                || ls.leading != span.leading
-                || ls.tab_stops != span.tab_stops
-                || last_text_format_element.is_none()
-            {
-                let new_tf = XmlNode::new_element(mc, "TEXTFORMAT".into(), document);
+impl<'a> FormatState<'a> {
+    fn open_tags(&mut self) {
+        if self.is_open {
+            return;
+        }
 
-                if ls.left_margin != 0.0 {
-                    new_tf.set_attribute_value(
-                        mc,
-                        XmlName::from_str("LEFTMARGIN"),
-                        AvmString::new_utf8(mc, span.left_margin.to_string()),
-                    );
-                }
-
-                if ls.right_margin != 0.0 {
-                    new_tf.set_attribute_value(
-                        mc,
-                        XmlName::from_str("RIGHTMARGIN"),
-                        AvmString::new_utf8(mc, span.right_margin.to_string()),
-                    );
-                }
-
-                if ls.indent != 0.0 {
-                    new_tf.set_attribute_value(
-                        mc,
-                        XmlName::from_str("INDENT"),
-                        AvmString::new_utf8(mc, span.indent.to_string()),
-                    );
-                }
-
-                if ls.block_indent != 0.0 {
-                    new_tf.set_attribute_value(
-                        mc,
-                        XmlName::from_str("BLOCKINDENT"),
-                        AvmString::new_utf8(mc, span.block_indent.to_string()),
-                    );
-                }
-
-                if ls.leading != 0.0 {
-                    new_tf.set_attribute_value(
-                        mc,
-                        XmlName::from_str("LEADING"),
-                        AvmString::new_utf8(mc, span.leading.to_string()),
-                    );
-                }
-
-                if !ls.tab_stops.is_empty() {
-                    let tab_stops = span
+        if self.span.left_margin != 0.0
+            || self.span.right_margin != 0.0
+            || self.span.indent != 0.0
+            || self.span.leading != 0.0
+            || self.span.block_indent != 0.0
+            || !self.span.tab_stops.is_empty()
+        {
+            self.result.push_str(WStr::from_units(b"<TEXTFORMAT"));
+            if self.span.left_margin != 0.0 {
+                let _ = write!(self.result, " LEFTMARGIN=\"{}\"", self.span.left_margin);
+            }
+            if self.span.right_margin != 0.0 {
+                let _ = write!(self.result, " RIGHTMARGIN=\"{}\"", self.span.right_margin);
+            }
+            if self.span.indent != 0.0 {
+                let _ = write!(self.result, " INDENT=\"{}\"", self.span.indent);
+            }
+            if self.span.leading != 0.0 {
+                let _ = write!(self.result, " LEADING=\"{}\"", self.span.leading);
+            }
+            if self.span.block_indent != 0.0 {
+                let _ = write!(self.result, " BLOCKINDENT=\"{}\"", self.span.block_indent);
+            }
+            if !self.span.tab_stops.is_empty() {
+                let _ = write!(
+                    self.result,
+                    " TABSTOPS=\"{}\"",
+                    self.span
                         .tab_stops
                         .iter()
                         .map(f64::to_string)
                         .collect::<Vec<_>>()
-                        .join(",");
-                    new_tf.set_attribute_value(
-                        mc,
-                        XmlName::from_str("TABSTOPS"),
-                        AvmString::new_utf8(mc, tab_stops),
-                    );
-                }
-
-                last_text_format_element = Some(new_tf);
-                last_bullet = None;
-                last_paragraph = None;
-                last_font = None;
-                last_a = None;
-                last_b = None;
-                last_i = None;
-                last_u = None;
-
-                root.append_child(mc, new_tf).unwrap();
+                        .join(",")
+                );
             }
+            self.result.push_byte(b'>');
+        }
 
-            let mut can_span_create_bullets = start == 0;
-            for line in text.split([b'\n', b'\r'].as_ref()) {
-                if can_span_create_bullets && span.bullet
-                    || !can_span_create_bullets && last_span.map(|ls| ls.bullet).unwrap_or(false)
-                {
-                    let new_li = XmlNode::new_element(mc, "LI".into(), document);
-
-                    last_bullet = Some(new_li);
-                    last_paragraph = None;
-                    last_font = None;
-                    last_a = None;
-                    last_b = None;
-                    last_i = None;
-                    last_u = None;
-
-                    last_text_format_element
-                        .unwrap_or(root)
-                        .append_child(mc, new_li)
-                        .unwrap();
+        if self.span.bullet {
+            self.result.push_str(WStr::from_units(b"<LI>"));
+        } else {
+            let _ = write!(
+                self.result,
+                "<P ALIGN=\"{}\">",
+                match self.span.align {
+                    swf::TextAlign::Left => "LEFT",
+                    swf::TextAlign::Center => "CENTER",
+                    swf::TextAlign::Right => "RIGHT",
+                    swf::TextAlign::Justify => "JUSTIFY",
                 }
+            );
+        }
 
-                if ls.align != span.align || last_paragraph.is_none() {
-                    let new_p = XmlNode::new_element(mc, "P".into(), document);
-                    let align: &str = match span.align {
-                        swf::TextAlign::Left => "LEFT",
-                        swf::TextAlign::Center => "CENTER",
-                        swf::TextAlign::Right => "RIGHT",
-                        swf::TextAlign::Justify => "JUSTIFY",
-                    };
+        let _ = write!(
+            self.result,
+            "<FONT FACE=\"{}\" SIZE=\"{}\" COLOR=\"#{:0>2X}{:0>2X}{:0>2X}\" LETTERSPACING=\"{}\" KERNING=\"{}\">",
+            self.span.font,
+            self.span.size,
+            self.span.color.r,
+            self.span.color.g,
+            self.span.color.b,
+            self.span.letter_spacing,
+            if self.span.kerning { "1" } else { "0" },
+        );
+        self.font_stack.push_front(self.span);
 
-                    new_p.set_attribute_value(mc, XmlName::from_str("ALIGN"), align.into());
+        if !self.span.url.is_empty() {
+            let _ = write!(
+                self.result,
+                "<A HREF=\"{}\" TARGET=\"{}\">",
+                self.span.url, self.span.target
+            );
+        }
 
-                    last_bullet
-                        .or(last_text_format_element)
-                        .unwrap_or(root)
-                        .append_child(mc, new_p)
-                        .unwrap();
-                    last_paragraph = Some(new_p);
-                    last_font = None;
-                    last_a = None;
-                    last_b = None;
-                    last_i = None;
-                    last_u = None;
+        if self.span.bold {
+            self.result.push_str(WStr::from_units(b"<B>"));
+        }
+
+        if self.span.italic {
+            self.result.push_str(WStr::from_units(b"<I>"));
+        }
+
+        if self.span.underline {
+            self.result.push_str(WStr::from_units(b"<U>"));
+        }
+
+        self.is_open = true;
+    }
+
+    fn close_tags(&mut self) {
+        if !self.is_open {
+            return;
+        }
+
+        if self.span.underline {
+            self.result.push_str(WStr::from_units(b"</U>"));
+        }
+
+        if self.span.italic {
+            self.result.push_str(WStr::from_units(b"</I>"));
+        }
+
+        if self.span.bold {
+            self.result.push_str(WStr::from_units(b"</B>"));
+        }
+
+        if !self.span.url.is_empty() {
+            self.result.push_str(WStr::from_units(b"</A>"));
+        }
+
+        self.result
+            .push_str(&WStr::from_units(b"</FONT>").repeat(self.font_stack.len()));
+        self.font_stack.clear();
+
+        if self.span.bullet {
+            self.result.push_str(WStr::from_units(b"</LI>"));
+        } else {
+            self.result.push_str(WStr::from_units(b"</P>"));
+        }
+
+        if self.span.left_margin != 0.0
+            || self.span.right_margin != 0.0
+            || self.span.indent != 0.0
+            || self.span.leading != 0.0
+            || self.span.block_indent != 0.0
+            || !self.span.tab_stops.is_empty()
+        {
+            self.result.push_str(WStr::from_units(b"</TEXTFORMAT>"));
+        }
+
+        self.is_open = false;
+    }
+
+    fn set_span(&mut self, span: &'a TextSpan) {
+        if !span.underline && self.span.underline {
+            self.result.push_str(WStr::from_units(b"</U>"));
+        }
+
+        if !span.italic && self.span.italic {
+            self.result.push_str(WStr::from_units(b"</I>"));
+        }
+
+        if !span.bold && self.span.bold {
+            self.result.push_str(WStr::from_units(b"</B>"));
+        }
+
+        if span.url != self.span.url && !self.span.url.is_empty() {
+            self.result.push_str(WStr::from_units(b"</A>"));
+        }
+
+        if span.font != self.span.font
+            || span.size != self.span.size
+            || span.color != self.span.color
+            || span.letter_spacing != self.span.letter_spacing
+            || span.kerning != self.span.kerning
+        {
+            let pos = self.font_stack.iter().position(|font| {
+                span.font == font.font
+                    && span.size == font.size
+                    && span.color == font.color
+                    && span.letter_spacing == font.letter_spacing
+                    && span.kerning == font.kerning
+            });
+            if let Some(pos) = pos {
+                self.result
+                    .push_str(&WStr::from_units(b"</FONT>").repeat(pos));
+                self.font_stack.drain(0..pos);
+            } else {
+                self.result.push_str(WStr::from_units(b"<FONT"));
+                if span.font != self.span.font {
+                    let _ = write!(self.result, " FACE=\"{}\"", span.font);
                 }
-
-                if ls.font != span.font
-                    || ls.size != span.size
-                    || ls.color != span.color
-                    || ls.letter_spacing != span.letter_spacing
-                    || ls.kerning != span.kerning
-                    || last_font.is_none()
-                {
-                    let new_font = XmlNode::new_element(mc, "FONT".into(), document);
-
-                    if ls.font != span.font || last_font.is_none() {
-                        new_font.set_attribute_value(
-                            mc,
-                            XmlName::from_str("FACE"),
-                            AvmString::new(mc, span.font.clone()),
-                        );
-                    }
-
-                    if ls.size != span.size || last_font.is_none() {
-                        new_font.set_attribute_value(
-                            mc,
-                            XmlName::from_str("SIZE"),
-                            AvmString::new_utf8(mc, span.size.to_string()),
-                        );
-                    }
-
-                    if ls.color != span.color || last_font.is_none() {
-                        let color = format!(
-                            "#{:0>2X}{:0>2X}{:0>2X}",
-                            span.color.r, span.color.g, span.color.b
-                        );
-                        new_font.set_attribute_value(
-                            mc,
-                            XmlName::from_str("COLOR"),
-                            AvmString::new_utf8(mc, color),
-                        );
-                    }
-
-                    if ls.letter_spacing != span.letter_spacing || last_font.is_none() {
-                        new_font.set_attribute_value(
-                            mc,
-                            XmlName::from_str("LETTERSPACING"),
-                            AvmString::new_utf8(mc, span.letter_spacing.to_string()),
-                        );
-                    }
-
-                    if ls.kerning != span.kerning || last_font.is_none() {
-                        new_font.set_attribute_value(
-                            mc,
-                            XmlName::from_str("KERNING"),
-                            if span.kerning { "1".into() } else { "0".into() },
-                        );
-                    }
-
-                    last_font
-                        .or(last_paragraph)
-                        .or(last_bullet)
-                        .or(last_text_format_element)
-                        .unwrap_or(root)
-                        .append_child(mc, new_font)
-                        .unwrap();
-
-                    last_font = Some(new_font);
-                    last_a = None;
-                    last_b = None;
-                    last_i = None;
-                    last_u = None;
+                if span.size != self.span.size {
+                    let _ = write!(self.result, " SIZE=\"{}\"", span.size);
                 }
-
-                if !span.url.is_empty() && (ls.url != span.url || last_a.is_none()) {
-                    let new_a = XmlNode::new_element(mc, "A".into(), document);
-
-                    new_a.set_attribute_value(
-                        mc,
-                        XmlName::from_str("HREF"),
-                        AvmString::new(mc, span.url.clone()),
+                if span.color != self.span.color {
+                    let _ = write!(
+                        self.result,
+                        " COLOR=\"#{:0>2X}{:0>2X}{:0>2X}\"",
+                        span.color.r, span.color.g, span.color.b
                     );
-
-                    if !span.target.is_empty() {
-                        new_a.set_attribute_value(
-                            mc,
-                            XmlName::from_str("TARGET"),
-                            AvmString::new(mc, span.target.clone()),
-                        );
-                    }
-
-                    last_font
-                        .or(last_paragraph)
-                        .or(last_bullet)
-                        .or(last_text_format_element)
-                        .unwrap_or(root)
-                        .append_child(mc, new_a)
-                        .unwrap();
-
-                    last_b = None;
-                    last_i = None;
-                    last_u = None;
-                } else if span.url.is_empty() && (ls.url != span.url || last_a.is_some()) {
-                    last_a = None;
-                    last_b = None;
-                    last_i = None;
-                    last_u = None;
                 }
-
-                if span.bold && last_b.is_none() {
-                    let new_b = XmlNode::new_element(mc, "B".into(), document);
-
-                    last_a
-                        .or(last_font)
-                        .or(last_paragraph)
-                        .or(last_bullet)
-                        .or(last_text_format_element)
-                        .unwrap_or(root)
-                        .append_child(mc, new_b)
-                        .unwrap();
-
-                    last_b = Some(new_b);
-                    last_i = None;
-                    last_u = None;
-                } else if !span.bold && last_b.is_some() {
-                    last_b = None;
-                    last_i = None;
-                    last_u = None;
+                if span.letter_spacing != self.span.letter_spacing {
+                    let _ = write!(self.result, " LETTERSPACING=\"{}\"", span.letter_spacing);
                 }
-
-                if span.italic && last_i.is_none() {
-                    let new_i = XmlNode::new_element(mc, "I".into(), document);
-
-                    last_b
-                        .or(last_a)
-                        .or(last_font)
-                        .or(last_paragraph)
-                        .or(last_bullet)
-                        .or(last_text_format_element)
-                        .unwrap_or(root)
-                        .append_child(mc, new_i)
-                        .unwrap();
-
-                    last_i = Some(new_i);
-                    last_u = None;
-                } else if !span.italic && last_i.is_some() {
-                    last_i = None;
-                    last_u = None;
+                if span.kerning != self.span.kerning {
+                    let _ = write!(
+                        self.result,
+                        " KERNING=\"{}\"",
+                        if span.kerning { "1" } else { "0" }
+                    );
                 }
-
-                if span.underline && last_u.is_none() {
-                    let new_u = XmlNode::new_element(mc, "U".into(), document);
-
-                    last_i
-                        .or(last_b)
-                        .or(last_a)
-                        .or(last_font)
-                        .or(last_paragraph)
-                        .or(last_bullet)
-                        .or(last_text_format_element)
-                        .unwrap_or(root)
-                        .append_child(mc, new_u)
-                        .unwrap();
-
-                    last_u = Some(new_u);
-                } else if !span.underline && last_u.is_some() {
-                    last_u = None;
-                }
-
-                let span_text = if last_bullet.is_some() {
-                    XmlNode::new_text(mc, AvmString::new(mc, line), document)
-                } else {
-                    let line_start = line.offset_in(text).unwrap();
-                    let line_with_newline = if line_start > 0 {
-                        text.slice(line_start - 1..line.len() + 1).unwrap_or(line)
-                    } else {
-                        line
-                    };
-
-                    XmlNode::new_text(mc, AvmString::new(mc, line_with_newline), document)
-                };
-
-                last_u
-                    .or(last_i)
-                    .or(last_b)
-                    .or(last_a)
-                    .or(last_font)
-                    .or(last_paragraph)
-                    .or(last_bullet)
-                    .or(last_text_format_element)
-                    .unwrap_or(root)
-                    .append_child(mc, span_text)
-                    .unwrap();
-
-                last_span = Some(span);
-                can_span_create_bullets = true;
+                self.result.push_byte(b'>');
+                self.font_stack.push_front(span);
             }
         }
 
-        document
+        if span.url != self.span.url && !span.url.is_empty() {
+            let _ = write!(
+                self.result,
+                "<A HREF=\"{}\" TARGET=\"{}\">",
+                span.url, span.target
+            );
+        }
+
+        if span.bold && !self.span.bold {
+            self.result.push_str(WStr::from_units(b"<B>"));
+        }
+
+        if span.italic && !self.span.italic {
+            self.result.push_str(WStr::from_units(b"<I>"));
+        }
+
+        if span.underline && !self.span.underline {
+            self.result.push_str(WStr::from_units(b"<U>"));
+        }
+
+        self.span = span;
+    }
+
+    fn push_text(&mut self, text: &WStr) {
+        for (i, text) in text.split(&[b'\n', b'\r'][..]).enumerate() {
+            self.open_tags();
+            if i > 0 {
+                self.close_tags();
+            }
+            let encoded = text.to_utf8_lossy();
+            let escaped = escape(encoded.as_bytes());
+            self.result.push_str(WStr::from_units(&*escaped));
+        }
     }
 }

@@ -1,4 +1,4 @@
-//! flash.filter.DisplacementMapFilter object
+//! flash.filters.DisplacementMapFilter object
 
 use crate::avm1::activation::Activation;
 use crate::avm1::error::Error;
@@ -190,7 +190,7 @@ pub fn map_point<'gc>(
     if let Some(object) = this.as_displacement_map_filter_object() {
         let (x, y) = object.map_point();
 
-        let proto = activation.context.avm1.prototypes.point_constructor;
+        let proto = activation.context.avm1.prototypes().point_constructor;
         let point = proto.construct(activation, &[x.into(), y.into()])?;
         return Ok(point);
     }
@@ -219,13 +219,13 @@ pub fn set_map_point<'gc>(
 }
 
 pub fn mode<'gc>(
-    activation: &mut Activation<'_, 'gc, '_>,
+    _activation: &mut Activation<'_, 'gc, '_>,
     this: Object<'gc>,
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(object) = this.as_displacement_map_filter_object() {
         let mode: &WStr = object.mode().into();
-        return Ok(AvmString::new(activation.context.gc_context, mode).into());
+        return Ok(AvmString::from(mode).into());
     }
 
     Ok(Value::Undefined)

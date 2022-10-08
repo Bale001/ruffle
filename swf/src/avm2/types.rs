@@ -1,3 +1,4 @@
+use bitflags::bitflags;
 use std::marker::PhantomData;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -96,10 +97,20 @@ pub struct Method {
     pub name: Index<String>,
     pub params: Vec<MethodParam>,
     pub return_type: Index<Multiname>,
-    pub needs_arguments_object: bool,
-    pub needs_activation: bool,
-    pub needs_rest: bool,
-    pub needs_dxns: bool,
+    pub flags: MethodFlags,
+}
+
+bitflags! {
+    pub struct MethodFlags: u8 {
+        const NEED_ARGUMENTS  = 1 << 0;
+        const NEED_ACTIVATION = 1 << 1;
+        const NEED_REST       = 1 << 2;
+        const HAS_OPTIONAL    = 1 << 3;
+        const IGNORE_REST     = 1 << 4;
+        const NATIVE          = 1 << 5;
+        const SET_DXNS        = 1 << 6;
+        const HAS_PARAM_NAMES = 1 << 7;
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -121,16 +132,18 @@ pub struct MethodBody {
     pub traits: Vec<Trait>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Exception {
     pub from_offset: u32,
     pub to_offset: u32,
     pub target_offset: u32,
-    pub variable_name: Index<String>,
+    // Both of the following fields are actually `Multiname` indexes
+    // despite AVM 2 description saying they are `String` ones.
+    pub variable_name: Index<Multiname>,
     pub type_name: Index<Multiname>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Opcode;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -152,13 +165,13 @@ pub enum DefaultValue {
     Private(Index<Namespace>),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Metadata {
     pub name: Index<String>,
     pub items: Vec<MetadataItem>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetadataItem {
     pub key: Index<String>,
     pub value: Index<String>,

@@ -3,8 +3,9 @@ use crate::display_object::{DisplayObjectBase, DisplayObjectPtr, TDisplayObject}
 use crate::font::TextRenderSettings;
 use crate::prelude::*;
 use crate::tag_utils::SwfMovie;
-use crate::transform::Transform;
 use gc_arena::{Collect, GcCell, MutationContext};
+use ruffle_render::commands::CommandHandler;
+use ruffle_render::transform::Transform;
 use std::cell::{Ref, RefMut};
 use std::sync::Arc;
 
@@ -35,7 +36,7 @@ impl<'gc> Text<'gc> {
                     TextStatic {
                         swf,
                         id: tag.id,
-                        bounds: tag.bounds.clone().into(),
+                        bounds: (&tag.bounds).into(),
                         text_transform: tag.matrix.into(),
                         text_blocks: tag.records.clone(),
                     },
@@ -134,9 +135,10 @@ impl<'gc> TDisplayObject<'gc> for Text<'gc> {
                 for c in &block.glyphs {
                     if let Some(glyph) = font.get_glyph(c.index as usize) {
                         context.transform_stack.push(&transform);
+                        let glyph_shape_handle = glyph.shape_handle(context.renderer);
                         context
-                            .renderer
-                            .render_shape(glyph.shape_handle, context.transform_stack.transform());
+                            .commands
+                            .render_shape(glyph_shape_handle, context.transform_stack.transform());
                         context.transform_stack.pop();
                         transform.matrix.tx += Twips::new(c.advance);
                     }
@@ -197,10 +199,11 @@ impl<'gc> TDisplayObject<'gc> for Text<'gc> {
                             let mut matrix = glyph_matrix;
                             matrix.invert();
                             let point = matrix * point;
-                            let glyph_bounds: BoundingBox = (&glyph.shape.shape_bounds).into();
+                            let glyph_shape = glyph.as_shape();
+                            let glyph_bounds: BoundingBox = (&glyph_shape.shape_bounds).into();
                             if glyph_bounds.contains(point)
-                                && crate::shape_utils::shape_hit_test(
-                                    &glyph.shape,
+                                && ruffle_render::shape_utils::shape_hit_test(
+                                    &glyph_shape,
                                     point,
                                     &local_matrix,
                                 )

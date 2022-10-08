@@ -45,7 +45,7 @@ fn load_policy_file<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     avm_warn!(
         activation,
-        "System.security.allowInsecureDomain() not implemented"
+        "System.security.loadPolicyFile() not implemented"
     );
     Ok(Value::Undefined)
 }
@@ -100,7 +100,7 @@ pub fn create<'gc>(
     proto: Option<Object<'gc>>,
     fn_proto: Object<'gc>,
 ) -> Object<'gc> {
-    let security = ScriptObject::object(gc_context, proto);
+    let security = ScriptObject::new(gc_context, proto);
     define_properties_on(OBJECT_DECLS, gc_context, security, fn_proto);
     security.into()
 }

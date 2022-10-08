@@ -1,7 +1,6 @@
-#[cfg(not(target_family = "wasm"))]
 use crate::utils::BufferDimensions;
-#[cfg(not(target_family = "wasm"))]
-use image::{buffer::ConvertBuffer, Bgra, ImageBuffer, RgbaImage};
+use crate::Error;
+use ruffle_render::utils::unmultiply_alpha_rgba;
 use std::fmt::Debug;
 
 pub trait RenderTargetFrame: Debug {
@@ -60,7 +59,7 @@ impl SwapChainTarget {
             format,
             width: size.0,
             height: size.1,
-            present_mode: wgpu::PresentMode::Mailbox,
+            present_mode: wgpu::PresentMode::Fifo,
         };
         surface.configure(device, &surface_config);
         Self {
@@ -109,33 +108,39 @@ impl RenderTarget for SwapChainTarget {
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
 #[derive(Debug)]
 pub struct TextureTarget {
-    size: wgpu::Extent3d,
-    texture: wgpu::Texture,
-    format: wgpu::TextureFormat,
-    buffer: wgpu::Buffer,
-    buffer_dimensions: BufferDimensions,
+    pub size: wgpu::Extent3d,
+    pub texture: wgpu::Texture,
+    pub format: wgpu::TextureFormat,
+    pub buffer: wgpu::Buffer,
+    pub buffer_dimensions: BufferDimensions,
 }
 
-#[cfg(not(target_family = "wasm"))]
 #[derive(Debug)]
 pub struct TextureTargetFrame(wgpu::TextureView);
 
-#[cfg(not(target_family = "wasm"))]
-type BgraImage = ImageBuffer<Bgra<u8>, Vec<u8>>;
-
-#[cfg(not(target_family = "wasm"))]
 impl RenderTargetFrame for TextureTargetFrame {
     fn view(&self) -> &wgpu::TextureView {
         &self.0
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
 impl TextureTarget {
-    pub fn new(device: &wgpu::Device, size: (u32, u32)) -> Self {
+    pub fn new(device: &wgpu::Device, size: (u32, u32)) -> Result<Self, Error> {
+        if size.0 > device.limits().max_texture_dimension_2d
+            || size.1 > device.limits().max_texture_dimension_2d
+            || size.0 < 1
+            || size.1 < 1
+        {
+            return Err(format!(
+                "Texture target cannot be smaller than 1 or larger than {}px on either dimension (requested {} x {})",
+                device.limits().max_texture_dimension_2d,
+                size.0,
+                size.1
+            )
+            .into());
+        }
         let buffer_dimensions = BufferDimensions::new(size.0 as usize, size.1 as usize);
         let size = wgpu::Extent3d {
             width: size.0,
@@ -143,7 +148,7 @@ impl TextureTarget {
             depth_or_array_layers: 1,
         };
         let texture_label = create_debug_label!("Render target texture");
-        let format = wgpu::TextureFormat::Bgra8Unorm;
+        let format = wgpu::TextureFormat::Rgba8Unorm;
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: texture_label.as_deref(),
             size,
@@ -161,21 +166,32 @@ impl TextureTarget {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        Self {
+        Ok(Self {
             size,
             texture,
             format,
             buffer,
             buffer_dimensions,
-        }
+        })
     }
 
-    pub fn capture(&self, device: &wgpu::Device) -> Option<RgbaImage> {
-        let buffer_future = self.buffer.slice(..).map_async(wgpu::MapMode::Read);
+    /// Captures the current contents of our texture buffer
+    /// as an `RgbaImage`
+    pub fn capture(
+        &self,
+        device: &wgpu::Device,
+        premultiplied_alpha: bool,
+    ) -> Option<image::RgbaImage> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let buffer_slice = self.buffer.slice(..);
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            sender.send(result).unwrap();
+        });
         device.poll(wgpu::Maintain::Wait);
-        match futures::executor::block_on(buffer_future) {
+        let result = receiver.recv().unwrap();
+        match result {
             Ok(()) => {
-                let map = self.buffer.slice(..).get_mapped_range();
+                let map = buffer_slice.get_mapped_range();
                 let mut buffer = Vec::with_capacity(
                     self.buffer_dimensions.height * self.buffer_dimensions.unpadded_bytes_per_row,
                 );
@@ -186,11 +202,16 @@ impl TextureTarget {
                         .extend_from_slice(&chunk[..self.buffer_dimensions.unpadded_bytes_per_row]);
                 }
 
-                let bgra = BgraImage::from_raw(self.size.width, self.size.height, buffer);
-                let ret = bgra.map(|image| image.convert());
+                // The image copied from the GPU uses premultiplied alpha, so
+                // convert to straight alpha if requested by the user.
+                if !premultiplied_alpha {
+                    unmultiply_alpha_rgba(&mut buffer);
+                }
+
+                let image = image::RgbaImage::from_raw(self.size.width, self.size.height, buffer);
                 drop(map);
                 self.buffer.unmap();
-                ret
+                image
             }
             Err(e) => {
                 log::error!("Unknown error reading capture buffer: {:?}", e);
@@ -200,32 +221,12 @@ impl TextureTarget {
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
 impl RenderTarget for TextureTarget {
     type Frame = TextureTargetFrame;
 
     fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
-        self.size.width = width;
-        self.size.height = height;
-
-        let label = create_debug_label!("Render target texture");
-        self.texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: label.as_deref(),
-            size: self.size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: self.format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-        });
-
-        let buffer_label = create_debug_label!("Render target buffer");
-        self.buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: buffer_label.as_deref(),
-            size: width as u64 * height as u64 * 4,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
+        *self =
+            TextureTarget::new(device, (width, height)).expect("Unable to resize texture target");
     }
 
     fn format(&self) -> wgpu::TextureFormat {

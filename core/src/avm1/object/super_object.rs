@@ -3,11 +3,11 @@
 use crate::avm1::activation::Activation;
 use crate::avm1::error::Error;
 use crate::avm1::function::ExecutionReason;
-use crate::avm1::object::script_object::TYPE_OF_OBJECT;
 use crate::avm1::object::{search_prototype, ExecutionName};
 use crate::avm1::property::Attribute;
-use crate::avm1::{AvmString, Object, ObjectPtr, ScriptObject, TObject, Value};
+use crate::avm1::{Object, ObjectPtr, ScriptObject, TObject, Value};
 use crate::display_object::DisplayObject;
+use crate::string::AvmString;
 use gc_arena::{Collect, GcCell, MutationContext};
 
 /// Implementation of the `super` object in AS2.
@@ -77,7 +77,7 @@ impl<'gc> TObject<'gc> for SuperObject<'gc> {
         &self,
         name: AvmString<'gc>,
         activation: &mut Activation<'_, 'gc, '_>,
-        _this: Object<'gc>,
+        _this: Value<'gc>,
         args: &[Value<'gc>],
     ) -> Result<Value<'gc>, Error<'gc>> {
         let constructor = self
@@ -88,7 +88,7 @@ impl<'gc> TObject<'gc> for SuperObject<'gc> {
             Some(exec) => exec.exec(
                 ExecutionName::Dynamic(name),
                 activation,
-                self.0.read().this,
+                self.0.read().this.into(),
                 self.0.read().depth + 1,
                 args,
                 ExecutionReason::FunctionCall,
@@ -103,6 +103,7 @@ impl<'gc> TObject<'gc> for SuperObject<'gc> {
         name: AvmString<'gc>,
         args: &[Value<'gc>],
         activation: &mut Activation<'_, 'gc, '_>,
+        reason: ExecutionReason,
     ) -> Result<Value<'gc>, Error<'gc>> {
         let this = self.0.read().this;
         let (method, depth) =
@@ -115,13 +116,13 @@ impl<'gc> TObject<'gc> for SuperObject<'gc> {
             Some(exec) => exec.exec(
                 ExecutionName::Dynamic(name),
                 activation,
-                this,
+                this.into(),
                 self.0.read().depth + depth + 1,
                 args,
-                ExecutionReason::FunctionCall,
+                reason,
                 method,
             ),
-            None => method.call(name, activation, this, args),
+            None => method.call(name, activation, this.into(), args),
         }
     }
 
@@ -264,10 +265,6 @@ impl<'gc> TObject<'gc> for SuperObject<'gc> {
 
     fn get_keys(&self, _activation: &mut Activation<'_, 'gc, '_>) -> Vec<AvmString<'gc>> {
         vec![]
-    }
-
-    fn type_of(&self) -> &'static str {
-        TYPE_OF_OBJECT
     }
 
     fn length(&self, _activation: &mut Activation<'_, 'gc, '_>) -> Result<i32, Error<'gc>> {
