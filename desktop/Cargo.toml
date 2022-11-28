@@ -12,7 +12,7 @@ cpal = "0.14.0"
 ruffle_core = { path = "../core", features = ["audio", "symphonia", "nellymoser"] }
 ruffle_render_wgpu = { path = "../render/wgpu", features = ["clap"] }
 ruffle_video_software = { path = "../video/software", optional = true }
-env_logger = { version = "0.9", default-features = false, features = ["humantime"] }
+env_logger = { version = "0.10", default-features = false, features = ["humantime"] }
 generational-arena = "0.2.8"
 log = "0.4"
 winit = "0.26.1"
