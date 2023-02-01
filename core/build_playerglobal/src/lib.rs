@@ -23,6 +23,9 @@ const METADATA_INSTANCE_ALLOCATOR: &str = "InstanceAllocator";
 // Indicates that we should generate a reference to a native initializer
 // method (used as a metadata key with `Ruffle` metadata)
 const METADATA_NATIVE_INSTANCE_INIT: &str = "NativeInstanceInit";
+// Indicates that the method is not actually implemented, and that
+// we should generate a stub in it's place.
+const METADATA_METHOD_STUB: &str = "Stub";
 
 /// If successful, returns a list of paths that were used. If this is run
 /// from a build script, these paths should be printed with
@@ -146,13 +149,36 @@ fn flash_to_rust_path(path: &str) -> String {
     components.join("::")
 }
 
+fn generate_stub(abc: &AbcFile, trait_: &Trait, parent: Option<Index<Multiname>>) -> TokenStream {
+    let (flash_path, _) = rust_method_name_and_path(abc, trait_, parent, "", "");
+    let (namespace, method) = flash_path
+        .rsplit_once("::")
+        .expect("Generated invalid flash path for stub");
+    let stub_code = match trait_.kind {
+        TraitKind::Setter { .. } => quote! {
+            crate::avm2_stub_setter!(activation, #namespace, #method);
+        },
+        TraitKind::Getter { .. } => quote! {
+            crate::avm2_stub_setter!(activation, #namespace, #method);
+        },
+        TraitKind::Method { .. } => quote! {
+            crate::avm2_stub_method!(activation, #namespace, #method);
+        },
+        _ => panic!("Generating stub for unsupported function"),
+    };
+    quote! { Some((#flash_path, |activation, _this, _args| {
+        #stub_code
+        Ok(crate::avm2::Value::Undefined)
+    }))}
+}
+
 fn rust_method_name_and_path(
     abc: &AbcFile,
     trait_: &Trait,
     parent: Option<Index<Multiname>>,
     prefix: &str,
     suffix: &str,
-) -> TokenStream {
+) -> (String, String) {
     let mut path = "crate::avm2::globals::".to_string();
 
     let trait_name = &abc.constant_pool.multinames[trait_.name.0 as usize - 1];
@@ -207,6 +233,17 @@ fn rust_method_name_and_path(
 
     path += suffix;
 
+    (flash_method_path, path)
+}
+
+fn rust_method_name_and_path_stream(
+    abc: &AbcFile,
+    trait_: &Trait,
+    parent: Option<Index<Multiname>>,
+    prefix: &str,
+    suffix: &str,
+) -> TokenStream {
+    let (flash_method_path, path) = rust_method_name_and_path(abc, trait_, parent, prefix, suffix);
     // Now that we've built up the path, convert it into a `TokenStream`.
     // This gives us something like
     // `crate::avm2::globals::flash::system::Security::allowDomain`
@@ -274,6 +311,30 @@ fn write_native_table(data: &[u8], out_dir: &Path) -> Result<Vec<u8>, Box<dyn st
             | TraitKind::Getter { method, .. }
             | TraitKind::Setter { method, .. } => {
                 let abc_method = &abc.methods[method.0 as usize];
+                for metadata_idx in &trait_.metadata {
+                    let metadata = &abc.metadata[metadata_idx.0 as usize];
+                    let name = &abc.constant_pool.strings[metadata.name.0 as usize - 1];
+                    match name.as_str() {
+                        RUFFLE_METADATA_NAME => {}
+                        _ => panic!("Unexpected class metadata {name:?}"),
+                    }
+
+                    for item in &metadata.items {
+                        let key = if item.key.0 != 0 {
+                            Some(abc.constant_pool.strings[item.key.0 as usize - 1].as_str())
+                        } else {
+                            None
+                        };
+                        let value = &abc.constant_pool.strings[item.value.0 as usize - 1];
+                        match (key, value.as_str()) {
+                            (None, METADATA_METHOD_STUB) => {
+                                rust_paths[method.0 as usize] = generate_stub(&abc, trait_, parent);
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 // We only want to process native methods
                 if !abc_method.flags.contains(MethodFlags::NATIVE) {
                     return;
@@ -298,7 +359,7 @@ fn write_native_table(data: &[u8], out_dir: &Path) -> Result<Vec<u8>, Box<dyn st
         };
 
         rust_paths[method_id.0 as usize] =
-            rust_method_name_and_path(&abc, trait_, parent, method_prefix, "");
+            rust_method_name_and_path_stream(&abc, trait_, parent, method_prefix, "");
     };
 
     // Look for `[Ruffle(InstanceAllocator)]` metadata - if present,
@@ -340,17 +401,18 @@ fn write_native_table(data: &[u8], out_dir: &Path) -> Result<Vec<u8>, Box<dyn st
                     (None, METADATA_INSTANCE_ALLOCATOR) => {
                         // This results in a path of the form
                         // `crate::avm2::globals::<path::to::class>::<class_allocator>`
-                        rust_instance_allocators[class_id as usize] = rust_method_name_and_path(
-                            &abc,
-                            trait_,
-                            None,
-                            "",
-                            &instance_allocator_method_name,
-                        );
+                        rust_instance_allocators[class_id as usize] =
+                            rust_method_name_and_path_stream(
+                                &abc,
+                                trait_,
+                                None,
+                                "",
+                                &instance_allocator_method_name,
+                            );
                     }
                     (None, METADATA_NATIVE_INSTANCE_INIT) => {
                         rust_native_instance_initializers[class_id as usize] =
-                            rust_method_name_and_path(
+                            rust_method_name_and_path_stream(
                                 &abc,
                                 trait_,
                                 None,
