@@ -76,6 +76,7 @@ package flash.events
             return this.formatToString("MouseEvent","type","bubbles","cancelable","eventPhase","localX","localY","stageX","stageY","relatedObject","ctrlKey","altKey","shiftKey","buttonDown","delta");
         }
 
+        [Ruffle(Stub)]
         public function updateAfterEvent():void {
             // TODO - determine when we should actually force a frame to be rendered.
             log_warn("MouseEvent.updateAfterEvent is not yet implemented");
