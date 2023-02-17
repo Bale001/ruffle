@@ -1,6 +1,7 @@
 //! Application Domains
 
 use crate::avm2::activation::Activation;
+use crate::avm2::error::ReferenceErrorCode;
 use crate::avm2::object::{ByteArrayObject, TObject};
 use crate::avm2::property_map::PropertyMap;
 use crate::avm2::script::Script;
@@ -131,16 +132,12 @@ impl<'gc> Domain<'gc> {
     ) -> Result<(QName<'gc>, Script<'gc>), Error<'gc>> {
         match self.get_defining_script(multiname)? {
             Some(val) => Ok(val),
-            None => Err(Error::AvmError(crate::avm2::error::reference_error(
+            None => Err(crate::avm2::error::make_reference_error(
                 activation,
-                &format!(
-                    "Error #1065: Variable {} is not defined.",
-                    multiname
-                        .local_name()
-                        .ok_or("Attempted to resolve uninitiated multiname")?
-                ),
-                1065,
-            )?)),
+                ReferenceErrorCode::NotDefined,
+                multiname,
+                None,
+            )),
         }
     }
 
