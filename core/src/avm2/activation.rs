@@ -239,7 +239,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         } else if let Some(obj) = outer_scope.find(name, self)? {
             Ok(Some(obj))
         } else if let Some(global) = self.global_scope() {
-            if global.base().has_own_dynamic_property(name) {
+            if global.base().find_property_local(name).is_some() {
                 Ok(Some(global))
             } else {
                 Ok(None)
@@ -261,11 +261,11 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         } else if let Some(result) = outer_scope.resolve(name, self)? {
             Ok(Some(result))
         } else if let Some(global) = self.global_scope() {
-            let prop = global.base().get_property_local(name, self)?;
-            if prop == Value::Undefined {
-                return Ok(None);
+            if let Some(prop) = global.base().find_property_local(name) {
+                Ok(Some(prop))
+            } else {
+                Ok(None)
             }
-            Ok(Some(prop))
         } else {
             Ok(None)
         }

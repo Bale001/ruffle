@@ -142,32 +142,18 @@ impl<'gc> ScriptObjectData<'gc> {
         }
     }
 
-    pub fn get_property_local(
-        &self,
-        multiname: &Multiname<'gc>,
-        activation: &mut Activation<'_, 'gc>,
-    ) -> Result<Value<'gc>, Error<'gc>> {
+    pub fn find_property_local(&self, multiname: &Multiname<'gc>) -> Option<Value<'gc>> {
         if !multiname.contains_public_namespace() {
-            return Err(error::make_reference_error(
-                activation,
-                error::ReferenceErrorCode::InvalidRead,
-                multiname,
-                self.instance_of(),
-            ));
+            return None;
         }
 
         let Some(local_name) = multiname.local_name() else { // when can this happen?
-            return Err(error::make_reference_error(
-                activation,
-                error::ReferenceErrorCode::InvalidRead,
-                multiname,
-                self.instance_of(),
-            ));
+            return None;
         };
 
         let value = self.values.get(&local_name);
         if let Some(value) = value {
-            return Ok(*value);
+            return Some(*value);
         }
 
         // follow the prototype chain
@@ -176,7 +162,7 @@ impl<'gc> ScriptObjectData<'gc> {
             let obj = obj.base();
             let value = obj.values.get(&local_name);
             if let Some(value) = value {
-                return Ok(*value);
+                return Some(*value);
             }
             proto = obj.proto();
         }
@@ -185,15 +171,25 @@ impl<'gc> ScriptObjectData<'gc> {
         // as dynamic properties that have not yet been set, and yield
         // `undefined`
         if self.is_sealed() {
-            return Err(error::make_reference_error(
+            None
+        } else {
+            Some(Value::Undefined)
+        }
+    }
+
+    pub fn get_property_local(
+        &self,
+        multiname: &Multiname<'gc>,
+        activation: &mut Activation<'_, 'gc>,
+    ) -> Result<Value<'gc>, Error<'gc>> {
+        self.find_property_local(multiname).ok_or_else(|| {
+            error::make_reference_error(
                 activation,
                 error::ReferenceErrorCode::InvalidRead,
                 multiname,
                 self.instance_of(),
-            ));
-        } else {
-            Ok(Value::Undefined)
-        }
+            )
+        })
     }
 
     pub fn set_property_local(
