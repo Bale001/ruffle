@@ -414,12 +414,11 @@ pub fn load_player_globals<'gc>(
     ));
 
     // Our activation environment is now functional enough to finish
-    // initializing the core class weave. The order of initialization shouldn't
-    // matter here, as long as all the initialization machinery can see and
-    // link the various system types together correctly.
+    // initializing the core class weave. The object class must be finished first
+    // since all other classes rely on object's vtable to be fully initialized.
+    let object_class = object_class.into_finished_class(activation)?;
     let class_class = class_class.into_finished_class(activation)?;
     let fn_class = fn_class.into_finished_class(activation)?;
-    let object_class = object_class.into_finished_class(activation)?;
     let _global_class = global_class.into_finished_class(activation)?;
 
     globals.set_proto(mc, global_proto);
