@@ -17,6 +17,7 @@ include "URIError.as"
 include "VerifyError.as"
 
 include "avmplus.as"
+include "avm2/intrinsics/memory.as"
 
 include "flash/accessibility/AccessibilityProperties.as"
 include "flash/accessibility/Accessibility.as"
