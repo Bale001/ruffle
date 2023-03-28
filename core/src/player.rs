@@ -1772,6 +1772,7 @@ impl Player {
                 frame_phase: &mut self.frame_phase,
                 stub_tracker: &mut self.stub_tracker,
                 stream_manager,
+                pseudo_avm1: false,
             };
 
             let old_frame_rate = *update_context.frame_rate;

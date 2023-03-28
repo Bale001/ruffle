@@ -1,5 +1,7 @@
 //! `MovieClip` display object and support code.
-use crate::avm1::{Object as Avm1Object, StageObject, TObject as Avm1TObject, Value as Avm1Value};
+use crate::avm1::{
+    Avm1, Object as Avm1Object, StageObject, TObject as Avm1TObject, Value as Avm1Value,
+};
 use crate::avm2::object::LoaderInfoObject;
 use crate::avm2::object::LoaderStream;
 use crate::avm2::Activation as Avm2Activation;
@@ -11,7 +13,6 @@ use crate::backend::audio::{SoundHandle, SoundInstanceHandle};
 use crate::backend::ui::MouseCursor;
 use bitflags::bitflags;
 
-use crate::avm1::Avm1;
 use crate::avm1::{Activation as Avm1Activation, ActivationIdentifier};
 use crate::binary_data::BinaryData;
 use crate::character::Character;
@@ -134,6 +135,8 @@ pub struct MovieClipData<'gc> {
 
     /// List of tags queued up for the current frame.
     queued_tags: HashMap<Depth, QueuedTagList>,
+
+    avm1_runtime: Option<GcCell<'gc, Avm1<'gc>>>,
 }
 
 impl<'gc> MovieClip<'gc> {
@@ -168,6 +171,7 @@ impl<'gc> MovieClip<'gc> {
                 #[cfg(feature = "timeline_debug")]
                 tag_frame_boundaries: Default::default(),
                 queued_tags: HashMap::new(),
+                avm1_runtime: None,
             },
         ))
     }
@@ -208,6 +212,7 @@ impl<'gc> MovieClip<'gc> {
                 #[cfg(feature = "timeline_debug")]
                 tag_frame_boundaries: Default::default(),
                 queued_tags: HashMap::new(),
+                avm1_runtime: None,
             },
         ))
     }
@@ -252,6 +257,7 @@ impl<'gc> MovieClip<'gc> {
                 #[cfg(feature = "timeline_debug")]
                 tag_frame_boundaries: Default::default(),
                 queued_tags: HashMap::new(),
+                avm1_runtime: None,
             },
         ))
     }
@@ -318,6 +324,7 @@ impl<'gc> MovieClip<'gc> {
                 #[cfg(feature = "timeline_debug")]
                 tag_frame_boundaries: Default::default(),
                 queued_tags: HashMap::new(),
+                avm1_runtime: None,
             },
         ));
 
@@ -1437,7 +1444,18 @@ impl<'gc> MovieClip<'gc> {
         use swf::TagCode;
         let tag_callback = |reader: &mut SwfStream<'_>, tag_code, tag_len| {
             match tag_code {
-                TagCode::DoAction => self.do_action(context, reader, tag_len),
+                TagCode::DoAction => {
+                    if context.is_action_script_3() && !self.movie().is_action_script_3() {
+                        let mut context = context.reborrow();
+                        let avm1 = self.init_avm1_runtime(&mut context);
+                        let mut avm1_write = avm1.write(context.gc_context);
+                        context.avm1 = &mut avm1_write;
+                        context.pseudo_avm1 = true;
+                        self.do_action(&mut context, reader, tag_len)
+                    } else {
+                        self.do_action(context, reader, tag_len)
+                    }
+                }
                 TagCode::PlaceObject if run_display_actions && !context.is_action_script_3() => {
                     self.place_object(context, reader, 1)
                 }
@@ -1639,6 +1657,26 @@ impl<'gc> MovieClip<'gc> {
         _context: &mut UpdateContext<'_, 'gc>,
         _hit_target_frame: bool,
     ) {
+    }
+
+    fn init_avm1_runtime(self, context: &mut UpdateContext<'_, 'gc>) -> GcCell<'gc, Avm1<'gc>> {
+        let mut write = self.0.write(context.gc_context);
+        if let Some(avm1) = write.avm1_runtime {
+            avm1
+        } else {
+            let avm1 = GcCell::allocate(
+                context.gc_context,
+                Avm1::new_with_globals(
+                    context.gc_context,
+                    context.player_version,
+                    context.avm1.prototypes(),
+                    context.avm1.global_object(),
+                    context.avm1.broadcaster_functions(),
+                ),
+            );
+            write.avm1_runtime = Some(avm1);
+            avm1
+        }
     }
 
     #[cfg(feature = "timeline_debug")]
@@ -2082,11 +2120,17 @@ impl<'gc> MovieClip<'gc> {
         context: &mut UpdateContext<'_, 'gc>,
         display_object: DisplayObject<'gc>,
     ) {
-        let class_object = self
-            .0
-            .read()
-            .avm2_class
-            .unwrap_or_else(|| context.avm2.classes().movieclip);
+        let mut write = self.0.write(context.gc_context);
+        let class_object = write.avm2_class.unwrap_or_else(|| {
+            let class = if write.movie().is_action_script_3() || write.movie().num_frames() == 0 {
+                context.avm2.classes().movieclip
+            } else {
+                context.avm2.classes().avm1movie
+            };
+            write.avm2_class = Some(class);
+            class
+        });
+        drop(write);
 
         let mut constr_thing = || {
             let mut activation = Avm2Activation::from_nothing(context.reborrow());

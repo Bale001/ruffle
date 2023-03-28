@@ -1,6 +1,6 @@
 use crate::avm1::function::{ExecutionReason, FunctionObject};
 use crate::avm1::globals::as_broadcaster::BroadcasterFunctions;
-use crate::avm1::globals::{as_broadcaster, create_globals};
+use crate::avm1::globals::{as_broadcaster, create_globals, SystemPrototypes};
 use crate::avm1::object::stage_object;
 use crate::avm1::object::TObject;
 use crate::avm1::property_map::PropertyMap;
@@ -31,7 +31,7 @@ pub struct Avm1<'gc> {
     global_scope: Gc<'gc, Scope<'gc>>,
 
     /// System built-ins that we use internally to construct new objects.
-    prototypes: avm1::globals::SystemPrototypes<'gc>,
+    prototypes: Gc<'gc, avm1::globals::SystemPrototypes<'gc>>,
 
     /// Cached functions for the AsBroadcaster
     broadcaster_functions: BroadcasterFunctions<'gc>,
@@ -76,6 +76,39 @@ impl<'gc> Avm1<'gc> {
     pub fn new(gc_context: MutationContext<'gc, '_>, player_version: u8) -> Self {
         let (prototypes, globals, broadcaster_functions) = create_globals(gc_context);
 
+        Self {
+            player_version,
+            constant_pool: Gc::allocate(gc_context, vec![]),
+            global_scope: Gc::allocate(gc_context, Scope::from_global_object(globals)),
+            prototypes: Gc::allocate(gc_context, prototypes),
+            broadcaster_functions,
+            display_properties: stage_object::DisplayPropertyMap::new(gc_context),
+            stack: vec![],
+            registers: [
+                Value::Undefined,
+                Value::Undefined,
+                Value::Undefined,
+                Value::Undefined,
+            ],
+            halted: false,
+            max_recursion_depth: 255,
+            has_mouse_listener: false,
+            clip_exec_list: None,
+            constructor_registry_case_insensitive: PropertyMap::new(),
+            constructor_registry_case_sensitive: PropertyMap::new(),
+
+            #[cfg(feature = "avm_debug")]
+            debug_output: false,
+        }
+    }
+
+    pub fn new_with_globals(
+        gc_context: MutationContext<'gc, '_>,
+        player_version: u8,
+        prototypes: Gc<'gc, SystemPrototypes<'gc>>,
+        globals: Object<'gc>,
+        broadcaster_functions: BroadcasterFunctions<'gc>,
+    ) -> Self {
         Self {
             player_version,
             constant_pool: Gc::allocate(gc_context, vec![]),
@@ -346,8 +379,8 @@ impl<'gc> Avm1<'gc> {
     }
 
     /// Obtain system built-in prototypes for this instance.
-    pub fn prototypes(&self) -> &avm1::globals::SystemPrototypes<'gc> {
-        &self.prototypes
+    pub fn prototypes(&self) -> Gc<'gc, avm1::globals::SystemPrototypes<'gc>> {
+        self.prototypes
     }
 
     /// Obtains the constant pool to use for new activations from code sources that

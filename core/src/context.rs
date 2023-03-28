@@ -187,6 +187,9 @@ pub struct UpdateContext<'a, 'gc> {
 
     /// Manager of in-progress media streams.
     pub stream_manager: &'a mut StreamManager<'gc>,
+
+    /// Determines whether or not we are currently running AVM1 within AVM2.
+    pub pseudo_avm1: bool,
 }
 
 /// Convenience methods for controlling audio.
@@ -341,11 +344,12 @@ impl<'a, 'gc> UpdateContext<'a, 'gc> {
             actions_since_timeout_check: self.actions_since_timeout_check,
             frame_phase: self.frame_phase,
             stream_manager: self.stream_manager,
+            pseudo_avm1: false,
         }
     }
 
     pub fn is_action_script_3(&self) -> bool {
-        self.swf.is_action_script_3()
+        !self.pseudo_avm1 && self.swf.is_action_script_3()
     }
 
     pub fn avm_trace(&self, message: &str) {
