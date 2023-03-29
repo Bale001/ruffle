@@ -25,7 +25,7 @@ use crate::display_object::interactive::{
 };
 use crate::display_object::{
     Avm1Button, Avm2Button, Bitmap, DisplayObjectBase, DisplayObjectPtr, EditText, Graphic,
-    MorphShape, TDisplayObject, Text, Video,
+    MorphShape, TDisplayObject, Text, Video, Stage
 };
 use crate::drawing::Drawing;
 use crate::events::{ButtonKeyCode, ClipEvent, ClipEventResult};
@@ -93,6 +93,36 @@ impl<'gc> MovieClipWeak<'gc> {
     }
 }
 
+#[derive(Collect)]
+#[collect(no_drop)]
+struct Avm1RuntimeContainer<'gc> {
+    runtime: Avm1<'gc>,
+    stage: Stage<'gc>
+}
+
+impl<'gc> Avm1RuntimeContainer<'gc> {
+    fn new(context: &mut UpdateContext<'_, 'gc>, movieclip: Arc<SwfMovie>) -> Self {
+        Self {
+            runtime: Avm1::new_with_globals(
+                context.gc_context,
+                context.player_version,
+                context.avm1.prototypes(),
+                context.avm1.global_object(),
+                context.avm1.broadcaster_functions(),
+            ),
+            stage: Stage::empty(context.gc_context, false, movieclip)
+        }
+    }
+
+    fn with_context<T>(&mut self, context: &mut UpdateContext<'_, 'gc>, f: impl FnOnce(UpdateContext<'_, 'gc>) -> T) -> T {
+        let mut context = context.reborrow();
+        context.avm1 = &mut self.runtime;
+        context.pseudo_avm1 = true;
+        context.stage = self.stage;
+        f(context)
+    }
+}
+
 #[derive(Clone, Collect)]
 #[collect(no_drop)]
 pub struct MovieClipData<'gc> {
@@ -136,7 +166,7 @@ pub struct MovieClipData<'gc> {
     /// List of tags queued up for the current frame.
     queued_tags: HashMap<Depth, QueuedTagList>,
 
-    avm1_runtime: Option<GcCell<'gc, Avm1<'gc>>>,
+    avm1_runtime: Option<GcCell<'gc, Avm1RuntimeContainer<'gc>>>,
 }
 
 impl<'gc> MovieClip<'gc> {
@@ -1446,12 +1476,9 @@ impl<'gc> MovieClip<'gc> {
             match tag_code {
                 TagCode::DoAction => {
                     if context.is_action_script_3() && !self.movie().is_action_script_3() {
-                        let mut context = context.reborrow();
-                        let avm1 = self.init_avm1_runtime(&mut context);
-                        let mut avm1_write = avm1.write(context.gc_context);
-                        context.avm1 = &mut avm1_write;
-                        context.pseudo_avm1 = true;
-                        self.do_action(&mut context, reader, tag_len)
+                        self.init_avm1_runtime(context).write(context.gc_context).with_context(context, |mut context| {
+                            self.do_action(&mut context, reader, tag_len)
+                        })
                     } else {
                         self.do_action(context, reader, tag_len)
                     }
@@ -1659,21 +1686,12 @@ impl<'gc> MovieClip<'gc> {
     ) {
     }
 
-    fn init_avm1_runtime(self, context: &mut UpdateContext<'_, 'gc>) -> GcCell<'gc, Avm1<'gc>> {
+    fn init_avm1_runtime(self, context: &mut UpdateContext<'_, 'gc>) -> GcCell<'gc, Avm1RuntimeContainer<'gc>> {
         let mut write = self.0.write(context.gc_context);
         if let Some(avm1) = write.avm1_runtime {
             avm1
         } else {
-            let avm1 = GcCell::allocate(
-                context.gc_context,
-                Avm1::new_with_globals(
-                    context.gc_context,
-                    context.player_version,
-                    context.avm1.prototypes(),
-                    context.avm1.global_object(),
-                    context.avm1.broadcaster_functions(),
-                ),
-            );
+            let avm1 = GcCell::allocate(context.gc_context, Avm1RuntimeContainer::new(context, write.movie()));
             write.avm1_runtime = Some(avm1);
             avm1
         }
@@ -3834,7 +3852,7 @@ impl<'gc, 'a> MovieClipData<'gc> {
                     .static_data
                     .exported_name
                     .write(context.gc_context) = Some(name);
-            }
+            } 
         }
         Ok(())
     }
