@@ -166,6 +166,8 @@ pub struct Avm2<'gc> {
     /// strong references around (this matches Flash's behavior).
     orphan_objects: Rc<Vec<DisplayObjectWeak<'gc>>>,
 
+    pending_scripts: Vec<Script<'gc>>,
+
     /// The api version of our root movie clip. Note - this is used as the
     /// api version for swfs loaded via `Loader`, overriding the api version
     /// specified in the loaded SWF. This is only used for API versioning (hiding
@@ -234,6 +236,8 @@ impl<'gc> Avm2<'gc> {
             broadcast_list: Default::default(),
 
             orphan_objects: Default::default(),
+
+            pending_scripts: Default::default(),
 
             // Set the lowest version for now - this be overriden when we set our movie
             root_api_version: ApiVersion::AllVersions,
@@ -544,16 +548,12 @@ impl<'gc> Avm2<'gc> {
         let num_scripts = abc.scripts.len();
         let tunit = TranslationUnit::from_abc(abc, domain, name, movie, context.gc_context);
         for i in 0..num_scripts {
-            tunit.load_script(i as u32, context)?;
-        }
-
-        if !flags.contains(DoAbc2Flag::LAZY_INITIALIZE) {
-            for i in 0..num_scripts {
-                if let Some(mut script) = tunit.get_script(i) {
-                    script.globals(context)?;
-                }
+            let script = tunit.load_script(i as u32, context)?;
+            if !flags.contains(DoAbc2Flag::LAZY_INITIALIZE) {
+                context.avm2.run_script_later(script);
             }
         }
+
         Ok(())
     }
 
@@ -656,6 +656,18 @@ impl<'gc> Avm2<'gc> {
         } else {
             self.scope_stack.pop()
         }
+    }
+
+    pub fn run_script_later(&mut self, script: Script<'gc>) {
+        self.pending_scripts.push(script);
+    }
+
+    pub fn clear_pending_scripts(&mut self) {
+        self.pending_scripts.clear();
+    }
+
+    pub fn get_pending_script(&self, i: usize) -> Option<Script<'gc>> {
+        self.pending_scripts.get(i).cloned()
     }
 
     #[cfg(feature = "avm_debug")]

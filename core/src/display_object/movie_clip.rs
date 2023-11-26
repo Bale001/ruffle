@@ -669,6 +669,7 @@ impl<'gc> MovieClip<'gc> {
                     tag_len,
                     &mut cur_frame,
                     &mut start_pos,
+                    context,
                 ),
                 TagCode::ScriptLimits => self
                     .0
@@ -740,7 +741,7 @@ impl<'gc> MovieClip<'gc> {
             // End-of-clip should be treated as ShowFrame
             self.0
                 .write(context.gc_context)
-                .show_frame(&mut reader, 0, &mut cur_frame, &mut start_pos)
+                .show_frame(&mut reader, 0, &mut cur_frame, &mut start_pos, context)
                 .unwrap();
         }
 
@@ -4127,8 +4128,10 @@ impl<'gc, 'a> MovieClipData<'gc> {
         _tag_len: usize,
         cur_frame: &mut FrameNumber,
         _start_pos: &mut u64,
+        context: &mut UpdateContext<'_, 'gc>,
     ) -> Result<(), Error> {
         *cur_frame += 1;
+        self.init_scripts(context);
         Ok(())
     }
 
@@ -4140,6 +4143,7 @@ impl<'gc, 'a> MovieClipData<'gc> {
         tag_len: usize,
         cur_frame: &mut FrameNumber,
         start_pos: &mut u64,
+        context: &mut UpdateContext<'_, 'gc>,
     ) -> Result<(), Error> {
         let tag_stream_start = self.static_data.swf.as_ref().as_ptr() as u64;
         let end_pos = reader.get_ref().as_ptr() as u64 - tag_stream_start;
@@ -4153,7 +4157,22 @@ impl<'gc, 'a> MovieClipData<'gc> {
         *start_pos = end_pos;
         *cur_frame += 1;
 
+        self.init_scripts(context);
+
         Ok(())
+    }
+
+    #[inline]
+    fn init_scripts(&mut self, context: &mut UpdateContext<'_, 'gc>) {
+        let mut i = 0;
+        while let Some(mut script) = context.avm2.get_pending_script(i) {
+            if let Err(e) = script.globals(context) {
+                tracing::warn!("Error running script init: {e:?}");
+            }
+            i += 1;
+        }
+
+        context.avm2.clear_pending_scripts();
     }
 }
 
